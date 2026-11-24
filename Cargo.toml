@@ -1,0 +1,39 @@
+[package]
+name = "qucs-t"
+version = "0.1.0"
+edition = "2021"
+description = "Lumped thermal network simulator based on the Qucs-S-Rust schematic editor"
+license = "GPL-2.0-or-later"
+
+[[bin]]
+name = "qucs-t"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.33"
+resvg = { version = "0.50", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.23"
+rfd = "0.18"
+miniz_oxide = "0.8"
+csv = "1.4.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[lints.clippy]
+# geometry / UI code: long argument lists and tuple-heavy types are deliberate
+type_complexity = "allow"
+too_many_arguments = "allow"
+neg_cmp_op_on_partial_ord = "allow"
+needless_range_loop = "allow"
+field_reassign_with_default = "allow"
+manual_is_multiple_of = "allow"

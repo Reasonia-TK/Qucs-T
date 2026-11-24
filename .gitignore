@@ -1,0 +1,10 @@
+/target
+*_sim/
+snapshots/
+qucs_work/
+__pycache__/
+*.sch.tmp
+.claude/
+*_op/
+*_mc/
+dist/
