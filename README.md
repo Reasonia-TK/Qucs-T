@@ -15,6 +15,24 @@ cargo build --release
 
 サンプルでは発熱量 20 W の定常状態を計算できます。過渡解析の発熱表では、10–100 秒と 150–240 秒に 20 W を加えます。空気への対流と壁面への輻射は別々の枝です。
 
+## Windows 向けインストーラーのビルド
+
+Windows x64 の Rust ツールチェーンと MSVC の C++ ビルドツールを用意し、リポジトリのルートで PowerShell から実行します。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\package.ps1
+```
+
+リリースビルドを実行し、`dist\qucs-t-<バージョン>-windows-x64.zip` を生成します。ZIP には `qucs-t.exe`、インストール・アンインストール用の PowerShell スクリプト、マニュアル、サンプルが入ります。`target\release\qucs-t.exe` をビルド済みなら、上のコマンドの末尾に `-NoBuild` を付けると ZIP の作成だけを実行できます。
+
+インストールするには ZIP を展開し、展開したフォルダーで次を実行します。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+管理者権限は不要です。既定のインストール先は `%LOCALAPPDATA%\Programs\qucs-t` で、スタートメニューに **Qucs-T** が追加されます。`.qucst` の「プログラムから開く」に Qucs-T を登録するには `-Associate` を、ユーザーの PATH に追加するには `-AddToPath` を付けます。
+
 ## 熱回路図を作る
 
 1. 左のパレットから部品を選び、回路図上に配置します。
