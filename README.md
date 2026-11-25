@@ -2,6 +2,8 @@
 
 熱回路図から定常温度、温度の時間変化、枝ごとの熱流を求める Windows デスクトップアプリです。Qucs-S-Rust の回路図エディタ、自動配線、接続判定をベースにしています。熱解析は内蔵の Rust ソルバーで実行します。
 
+[Windows x64 版 v0.1.0 をダウンロード（ZIP）](https://github.com/Reasonia-TK/Qucs-T/releases/download/v0.1.0/qucs-t-0.1.0-windows-x64.zip)
+
 [ユーザーマニュアル](docs/user-manual.md)
 
 ## 起動
