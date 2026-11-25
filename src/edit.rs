@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Components + the wires that lie completely between them, in Qucs clipboard format.
 pub fn copy_text(doc: &Doc, comps: &[usize], wires: &[usize], paintings: &[usize]) -> String {
-    let mut s = Schematic::new_empty("clip");
+    let mut s = crate::thermal::empty();
     s.properties.clear();
     for &i in comps {
         if let Some(c) = doc.sch.components.get(i) {
@@ -42,7 +42,7 @@ pub fn copy_text(doc: &Doc, comps: &[usize], wires: &[usize], paintings: &[usize
     s.serialize()
 }
 
-/// Paste Qucs clipboard text, offset by (dx, dy); components are renamed when names clash.
+/// Paste Qucs-T clipboard text, offset by (dx, dy); components are renamed when names clash.
 /// Returns indices of the new components, wires and paintings.
 pub fn paste_text(doc: &mut Doc, text: &str, dx: i32, dy: i32) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>), String> {
     let t = text.trim();

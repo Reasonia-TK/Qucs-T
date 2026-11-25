@@ -291,10 +291,10 @@ mod tests {
 
     #[test]
     fn junction_action_only_targets_one_through_wire() {
-        let mut sch = Schematic::new_empty("junction");
+        let mut sch = crate::thermal::empty();
         sch.wires = vec![Wire::new(-40, 0, 40, 0), Wire::new(0, -20, 0, 0)];
         let find_junction = |sch: &Schematic| {
-            check(sch, &Connectivity::build(sch, None)).issues.into_iter()
+            check(sch, &Connectivity::build(sch)).issues.into_iter()
                 .find(|issue| issue.kind == "wire_end_on_wire_middle").unwrap()
         };
         let issue = find_junction(&sch);
@@ -305,7 +305,7 @@ mod tests {
         sch.wires.pop();
 
         sch.wires = crate::doc::split_wires_at(std::mem::take(&mut sch.wires), (0, 0));
-        let report = check(&sch, &Connectivity::build(&sch, None));
+        let report = check(&sch, &Connectivity::build(&sch));
         assert!(!report.issues.iter().any(|issue| issue.kind == "wire_end_on_wire_middle"));
     }
 }

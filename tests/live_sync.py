@@ -14,15 +14,13 @@ def call(name, **a):
     t = [c["text"] for c in r["content"] if c["type"] == "text"]
     if r["isError"]: raise SystemExit(t)
     return t[0] if t else None
-call("new_schematic", path="live", overwrite=True)
+call("new_thermal_schematic", path="live", overwrite=True)
 call("open_gui")
 time.sleep(float(sys.argv[1]) if len(sys.argv) > 1 else 4)
-call("add_components", components=[{"type": "Vdc", "name": "V1", "x": 100, "y": 200, "props": {"U": "5 V"}},
-                                   {"type": "R", "name": "R1", "x": 220, "y": 140},
-                                   {"type": "R", "name": "R2", "x": 320, "y": 200, "rotate": 1},
-                                   {"type": "LED", "name": "D1", "x": 320, "y": 300} if False else {"type": "Diode", "name": "D1", "x": 420, "y": 200, "rotate": 1},
-                                   {"type": "GND", "x": 100, "y": 320}])
-call("connect", nets=[["V1.+", "R1.1"], ["R1.2", "R2.1", "D1.A"], ["V1.-", "R2.2", "D1.K", "GND1.1"]], labels=["vin", "mid", ""])
+call("add_components", components=[{"type": "ThPower", "name": "P1", "x": 100, "y": 200},
+                                   {"type": "ThResistance", "name": "Rth1", "x": 220, "y": 140},
+                                   {"type": "ThBoundary", "name": "T1", "x": 340, "y": 200}])
+call("connect", nets=[["P1.1", "Rth1.1"], ["Rth1.2", "T1.1"]], labels=["hot", "ambient"])
 time.sleep(2)
 print(call("get_gui_state"))
 p.stdin.close(); p.wait(5)

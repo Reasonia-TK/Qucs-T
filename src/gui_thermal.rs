@@ -125,7 +125,7 @@ impl App {
         self.thermal.pending = Some((steady, schematic, receiver));
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let connection = Connectivity::build(&input, None);
+            let connection = Connectivity::build(&input);
             let output = Network::build(&input, &connection).and_then(|network| {
                 if steady {
                     network.steady()
@@ -160,7 +160,7 @@ impl App {
                         Ok(results) => {
                             self.thermal.map = TemperatureMap::new(
                                 &snapshot,
-                                &Connectivity::build(&snapshot, None),
+                                &Connectivity::build(&snapshot),
                                 &results,
                             );
                             self.thermal.map_time = 0.0;

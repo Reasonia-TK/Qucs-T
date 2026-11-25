@@ -1,28 +1,19 @@
 //! Qucs-T thermal network simulator and schematic editor.
 
 mod check;
-mod diagram;
 mod doc;
 mod edit;
 mod gui;
-mod hier;
 mod icon_pixels;
 mod library;
 mod mcp;
-mod montecarlo;
 mod netlist;
-mod palette;
 mod pdf;
 mod plot;
-mod qlib;
 mod render;
-mod rftools;
 mod router;
 mod schematic;
 mod settings;
-mod sim;
-mod spice;
-mod synth;
 mod thermal;
 mod thermal_grid;
 mod thermal_measurement;
@@ -37,6 +28,9 @@ fn usage() -> ! {
          qucs-t [gui] [file.qucst]                Open the thermal editor\n  \
          qucs-t steady <file.qucst> [out.csv]    Steady-state analysis\n  \
          qucs-t transient <file.qucst> [out.csv] Transient analysis\n  \
+         qucs-t check <file.qucst>              Check the layout\n  \
+         qucs-t render <file.qucst> <out>       Export a PNG or SVG schematic\n  \
+         qucs-t reroute <file.qucst> [out]      Reroute the schematic\n  \
          qucs-t mcp                             Start the stdio MCP server\n  \
          qucs-t --version",
         env!("CARGO_PKG_VERSION")
@@ -53,7 +47,7 @@ fn main() {
                 usage();
             }
             let path = PathBuf::from(&args[1]);
-            let doc = thermal::open_doc(&path).unwrap_or_else(|e| fail(&e));
+            let doc = doc::Doc::open(&path).unwrap_or_else(|e| fail(&e));
             let network = thermal::Network::build(&doc.sch, &doc.conn()).unwrap_or_else(|e| fail(&e));
             let result = if cmd == "steady" {
                 network.steady()
@@ -115,36 +109,11 @@ fn main() {
             d.sch.save(&out).unwrap_or_else(|e| fail(&e));
             println!("{r}");
         }
-        "netlist" => {
-            if args.len() < 2 {
-                usage();
-            }
-            let p = PathBuf::from(&args[1]);
-            let out = std::env::temp_dir().join("qucs-s-rs").join("cli_netlist.cir");
-            let net = if args.iter().any(|a| a == "--qucs-s") { sim::netlist_qucs_s(&p, &out) } else { sim::netlist(&p, &out) };
-            print!("{}", net.unwrap_or_else(|e| fail(&e)));
-        }
-        "simulate" => {
-            if args.len() < 2 {
-                usage();
-            }
-            let r = sim::simulate(&PathBuf::from(&args[1]), 300).unwrap_or_else(|e| fail(&e));
-            println!("{}", serde_json::to_string_pretty(&r.summary()).unwrap_or_default());
-        }
-        "op" => {
-            if args.len() < 2 {
-                usage();
-            }
-            let op = sim::operating_point(&PathBuf::from(&args[1]), 120).unwrap_or_else(|e| fail(&e));
-            println!("{}", serde_json::to_string_pretty(&op.json()).unwrap_or_default());
-        }
         "-V" | "--version" | "version" => println!("Qucs-T {}", env!("CARGO_PKG_VERSION")),
         "-h" | "--help" | "help" => usage(),
-        "gui" if args.get(1).is_some_and(|file| file.to_ascii_lowercase().ends_with(".sch")) => gui::run(args.get(1).map(PathBuf::from)),
         "gui" => gui::run_thermal(args.get(1).map(PathBuf::from)),
         "thermal-gui" => gui::run_thermal(args.get(1).map(PathBuf::from)),
         other if other.to_ascii_lowercase().ends_with(".qucst") => gui::run_thermal(Some(PathBuf::from(other))),
-        other if other.ends_with(".sch") => gui::run(Some(PathBuf::from(other))),
         _ => usage(),
     }
 }
@@ -161,60 +130,54 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn roundtrip_examples() {
-        for f in ["examples/inverting_amp.sch", "examples/follower_rerouted.sch"] {
-            let s = Schematic::load(Path::new(f)).unwrap();
-            let again = Schematic::parse(&s.serialize()).unwrap();
-            assert_eq!(s.components, again.components, "{f}");
-            assert_eq!(s.wires, again.wires, "{f}");
-        }
+    fn roundtrip_example() {
+        let sch = Doc::open(Path::new("examples/heatsink.qucst")).unwrap().sch;
+        assert_eq!(Schematic::parse(&sch.serialize()).unwrap(), sch);
     }
 
     #[test]
     fn pins_follow_qucs_rotation() {
         // vertical resistor (rotate=1): pin 1 at the bottom, pin 2 at the top
-        let c = crate::library::new_component("R", "R1", 100, 100).unwrap();
+        let c = crate::library::new_component("ThResistance", "R1", 100, 100).unwrap();
         let mut c1 = c.clone();
         c1.rotate = 1;
-        let p = crate::library::place(&c1, None);
+        let p = crate::library::place(&c1);
         assert_eq!((p.pins[0].x, p.pins[0].y), (100, 130));
         assert_eq!((p.pins[1].x, p.pins[1].y), (100, 70));
         assert_eq!(p.pins[0].dir, (0, 1));
-        // DC source default orientation is vertical with + on top
-        let v = crate::library::new_component("Vdc", "V1", 0, 0).unwrap();
-        let p = crate::library::place(&v, None);
-        let plus = p.pins.iter().find(|q| q.name == "+").unwrap();
-        assert_eq!((plus.x, plus.y), (0, -30));
+        let power = crate::library::new_component("ThPower", "P1", 0, 0).unwrap();
+        let p = crate::library::place(&power);
+        assert_eq!((p.pins[0].x, p.pins[0].y), (0, -30));
     }
 
     #[test]
     fn example_connectivity() {
-        let d = Doc::open(Path::new("examples/inverting_amp.sch")).unwrap();
+        let d = Doc::open(Path::new("examples/heatsink.qucst")).unwrap();
         let conn = d.conn();
-        let net = |pin: &str| conn.nets[conn.find_pin(pin).unwrap().net].name.clone();
-        assert_eq!(net("OP1.OUT"), "out");
-        assert_eq!(net("R1.1"), "in");
-        assert_eq!(net("V1.-"), "gnd");
-        assert_eq!(net("R2.1"), net("OP1.IN-"));
+        let net = |pin: &str| conn.nets[conn.find_pin(pin).unwrap().net].name.as_str();
+        assert_eq!(net("P1.1"), "発熱部品");
+        assert_eq!(net("Rc1.1"), net("P1.1"));
+        assert_eq!(net("Rc1.2"), "ヒートシンク");
+        assert_eq!(net("T1.1"), "空気");
         assert!(crate::check::check(&d.sch, &conn).issues.is_empty());
     }
 
     #[test]
     fn router_connects_cleanly() {
-        let mut d = Doc::new(Schematic::new_empty("t"), None);
+        let mut d = Doc::new(crate::thermal::empty(), None);
         let none = serde_json::Map::new();
-        d.add_component("Vdc", Some("V1"), 0, 100, None, None, &none).unwrap();
-        d.add_component("R", Some("R1"), 150, 40, None, None, &none).unwrap();
-        d.add_component("R", Some("R2"), 260, 120, Some(1), None, &none).unwrap();
-        d.add_component("GND", None, 0, 220, None, None, &none).unwrap();
-        d.connect(&["V1.+".into(), "R1.1".into()], Some("in")).unwrap();
+        d.add_component("ThPower", Some("P1"), 0, 100, None, None, &none).unwrap();
+        d.add_component("ThResistance", Some("R1"), 150, 40, None, None, &none).unwrap();
+        d.add_component("ThResistance", Some("R2"), 260, 120, Some(1), None, &none).unwrap();
+        d.add_component("ThBoundary", Some("T1"), 0, 220, None, None, &none).unwrap();
+        d.connect(&["P1.1".into(), "R1.1".into()], Some("in")).unwrap();
         d.connect(&["R1.2".into(), "R2.2".into()], Some("out")).unwrap();
-        d.connect(&["V1.-".into(), "R2.1".into(), "GND1.1".into()], None).unwrap();
+        d.connect(&["R2.1".into(), "T1.1".into()], Some("ambient")).unwrap();
         let conn = d.conn();
         let net = |pin: &str| conn.nets[conn.find_pin(pin).unwrap().net].name.clone();
         assert_eq!(net("R1.1"), "in");
         assert_eq!(net("R2.2"), "out");
-        assert_eq!(net("R2.1"), "gnd");
+        assert_eq!(net("R2.1"), "ambient");
         let rep = crate::check::check(&d.sch, &conn);
         assert_eq!(rep.metrics["errors"], 0, "{:?}", rep.issues);
         assert_eq!(rep.metrics["crossings"], 0);

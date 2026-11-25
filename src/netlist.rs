@@ -9,7 +9,6 @@
 use crate::library::{place, Placed};
 use crate::schematic::Schematic;
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub struct PinRef {
@@ -29,7 +28,7 @@ pub struct Net {
     pub pins: Vec<usize>,  // indices into Connectivity::pins
     pub wires: Vec<usize>, // indices into schematic wires
     pub islands: Vec<usize>,
-    pub named: bool, // name from a label / ground
+    pub named: bool, // name from a label
 }
 
 #[derive(Clone, Debug, Default)]
@@ -80,8 +79,8 @@ impl Dsu {
 }
 
 impl Connectivity {
-    pub fn build(sch: &Schematic, dir: Option<&Path>) -> Connectivity {
-        let placed: Vec<Placed> = sch.components.iter().map(|c| place(c, dir)).collect();
+    pub fn build(sch: &Schematic) -> Connectivity {
+        let placed: Vec<Placed> = sch.components.iter().map(place).collect();
         let mut ids: HashMap<(i32, i32), usize> = HashMap::new();
         let id = |p: (i32, i32), ids: &mut HashMap<(i32, i32), usize>| -> usize {
             let n = ids.len();
@@ -109,15 +108,11 @@ impl Connectivity {
             })
         };
         let mut pins = Vec::new();
-        let mut gnd_islands = Vec::new();
         for &(ci, pi, a) in &pin_pts {
             let is = island_of(a, &mut dsu, &mut islands);
             let c = &sch.components[ci];
             let pp = &placed[ci].pins[pi];
             islands[is].pins.push(pins.len());
-            if c.typ == "GND" {
-                gnd_islands.push(is);
-            }
             pins.push(PinRef { comp: ci, pin: pi, label: format!("{}.{}", c.name, pp.name), x: pp.x, y: pp.y, dir: pp.dir, net: 0, island: is });
         }
         let mut wire_island = Vec::new();
@@ -130,7 +125,7 @@ impl Connectivity {
             }
             wire_island.push(is);
         }
-        // islands -> nets (labels with the same name and all grounds are connected)
+        // islands -> nets (labels with the same name are connected)
         let mut nd = Dsu::new(islands.len());
         let mut by_label: HashMap<String, usize> = HashMap::new();
         for (i, isl) in islands.iter().enumerate() {
@@ -142,14 +137,6 @@ impl Connectivity {
                         by_label.insert(key, i);
                     }
                 }
-            }
-        }
-        if let Some(&g0) = gnd_islands.first() {
-            for &g in &gnd_islands {
-                nd.union(g0, g);
-            }
-            if let Some(&j) = by_label.get("gnd") {
-                nd.union(g0, j);
             }
         }
         let mut root_net: BTreeMap<usize, usize> = BTreeMap::new();
@@ -172,11 +159,6 @@ impl Connectivity {
             let n = islands[is].net;
             nets[n].wires.push(wi);
             wire_net.push(n);
-        }
-        for &g in &gnd_islands {
-            let n = islands[g].net;
-            nets[n].name = "gnd".into();
-            nets[n].named = true;
         }
         for isl in &islands {
             if let Some(l) = isl.labels.first() {

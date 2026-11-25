@@ -59,6 +59,9 @@ impl Doc {
 
     pub fn from_disk(path: &Path, bytes: Vec<u8>) -> Result<Doc, String> {
         let sch = Schematic::parse(&String::from_utf8_lossy(&bytes))?;
+        if let Some(component) = sch.components.iter().find(|c| !crate::thermal::is_element(&c.typ)) {
+            return Err(format!("{}: 未対応の熱回路素子です ({})", component.name, component.typ));
+        }
         Ok(Doc::from_schematic(sch, Some(path.to_path_buf()), Some(bytes)))
     }
 
@@ -77,12 +80,8 @@ impl Doc {
         Self::from_disk(self.path.as_deref()?, bytes).ok()
     }
 
-    pub fn dir(&self) -> Option<PathBuf> {
-        self.path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
-    }
-
     pub fn conn(&self) -> Connectivity {
-        Connectivity::build(&self.sch, self.dir().as_deref())
+        Connectivity::build(&self.sch)
     }
 
     pub fn checkpoint(&mut self) {
@@ -136,7 +135,7 @@ impl Doc {
         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
         let contents = self.sch.serialize();
         for n in 1..=u32::MAX {
-            let name = if n == 1 { format!("{stem}.local-draft.sch") } else { format!("{stem}.local-draft-{n}.sch") };
+            let name = if n == 1 { format!("{stem}.local-draft.qucst") } else { format!("{stem}.local-draft-{n}.qucst") };
             let draft = path.with_file_name(name);
             let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&draft) {
                 Ok(file) => file,
@@ -153,18 +152,18 @@ impl Doc {
         Err("no unused draft name".into())
     }
 
-    /// Qucs stores every ground as "*"; give each component a unique name so it can be addressed.
+    /// Give unnamed components unique internal names so their pins can be addressed.
     fn fix_names(&mut self) {
         let mut used: HashSet<String> = self.sch.components.iter().map(|c| c.name.clone()).collect();
         for i in 0..self.sch.components.len() {
             let c = &self.sch.components[i];
             if c.name == "*" || c.name.is_empty() {
-                let prefix = if c.typ == "GND" { "GND".to_string() } else { library::name_prefix(&c.typ) };
+                let prefix = library::name_prefix(&c.typ);
                 let name = unique_name(&prefix, &used);
                 used.insert(name.clone());
                 let c = &mut self.sch.components[i];
                 c.name = name;
-                c.active |= 4; // keep the name hidden like Qucs does for "*"
+                c.active |= 4; // preserve the hidden name
             }
         }
     }
@@ -193,32 +192,9 @@ impl Doc {
                 }
                 n.to_string()
             }
-            _ => {
-                let prefix = if typ == "GND" {
-                    "GND".into()
-                } else if typ == "Lib" {
-                    let lc = props.get("Lib").and_then(|l| props.get("Comp").map(|c| (l, c)));
-                    lc.and_then(|(l, c)| crate::qlib::find(l.as_str().unwrap_or(""), c.as_str().unwrap_or("")))
-                        .map(|(_, c)| if c.symbol.id_prefix.is_empty() { "X".to_string() } else { c.symbol.id_prefix.clone() })
-                        .unwrap_or_else(|| "X".into())
-                } else {
-                    library::name_prefix(typ)
-                };
-                self.unique(&prefix)
-            }
+            _ => self.unique(&library::name_prefix(typ)),
         };
-        let mut c = if typ == "Lib" {
-            let get = |k: &str| props.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let (Some(l), Some(cn)) = (get("Lib"), get("Comp")) else {
-                return Err("a Lib component needs \"lib\" and \"comp\" (see search_library)".into());
-            };
-            crate::qlib::new_lib_component(&l, &cn, &name, snap(x), snap(y))?
-        } else {
-            library::new_component(typ, &name, snap(x), snap(y))?
-        };
-        if typ == "GND" {
-            c.active |= 4;
-        }
+        let mut c = library::new_component(typ, &name, snap(x), snap(y))?;
         if let Some(r) = rotate {
             c.rotate = r.rem_euclid(4);
         }
@@ -241,10 +217,7 @@ impl Doc {
     /// with symbols, wires or other text; then the free-est of right/left/above/below.
     pub fn place_label(&mut self, i: usize, conn: Option<&Connectivity>) -> bool {
         let c = &self.sch.components[i];
-        if c.typ.starts_with('.') || library::is_text_block(&c.typ) {
-            return false;
-        }
-        let p = library::place(c, self.dir().as_deref());
+        let p = library::place(c);
         let lines = library::label_lines(c);
         if lines.is_empty() {
             return false;
@@ -758,8 +731,6 @@ impl Doc {
             keep
         });
         jobs.sort_by_key(|j| j.2);
-        let all_nets: Vec<Vec<String>> = jobs.iter().map(|j| j.0.clone()).collect();
-        let flipped = self.optimize_flips(&all_nets);
         let mut out = Vec::new();
         let mut failed = Vec::new();
         for (pins, labels, _) in jobs {
@@ -776,92 +747,7 @@ impl Doc {
         }
         let gain = self.improve_routes(2);
         let relabeled = self.fix_label_collisions();
-        Ok(json!({"nets_rerouted": out.len(), "failed": failed, "flipped": flipped, "improvement": gain, "labels_moved": relabeled}))
-    }
-
-    /// Before routing: turn symmetric two-pin parts (R, C, L) by 180° when that brings
-    /// each pin closer to the terminals it will be wired to ("pin swapping").
-    pub fn optimize_flips(&mut self, nets: &[Vec<String>]) -> Vec<String> {
-        const SYM: [&str; 6] = ["R", "C", "L", "R_SPICE", "C_SPICE", "L_SPICE"];
-        let mut flipped = Vec::new();
-        for _pass in 0..self.sch.components.len().min(60) {
-            let conn = self.conn();
-            let deg = conn.degree_map(&self.sch);
-            // (comp, pin) -> intended net index, and terminal positions per net
-            let mut pin_net: HashMap<(usize, usize), usize> = HashMap::new();
-            let mut pos: Vec<Vec<(usize, i32, i32)>> = vec![Vec::new(); nets.len()];
-            for (ni, n) in nets.iter().enumerate() {
-                for t in n {
-                    if let Some(p) = conn.find_pin(t) {
-                        pin_net.insert((p.comp, p.pin), ni);
-                        pos[ni].push((p.comp, p.x, p.y));
-                    } else if let Ok(tt) = self.resolve_terminal(&conn, t) {
-                        pos[ni].push((usize::MAX, tt.x, tt.y));
-                    }
-                }
-            }
-            let mut best: Option<(i32, usize)> = None;
-            for ci in 0..self.sch.components.len() {
-                let c = &self.sch.components[ci];
-                if !SYM.contains(&c.typ.as_str()) {
-                    continue;
-                }
-                if c.typ == "C" && c.props.get(2).map(|p| p.value.contains("polar")).unwrap_or(false) {
-                    continue;
-                }
-                let pins: Vec<&crate::netlist::PinRef> = conn.pins.iter().filter(|p| p.comp == ci).collect();
-                if pins.len() != 2 || pins.iter().any(|p| deg.get(&(p.x, p.y)).copied().unwrap_or(0) > 1) {
-                    continue;
-                }
-                // distance to the centroid of the other terminals of the pin's net
-                let dist = |pin_idx: usize, x: i32, y: i32| -> f64 {
-                    let Some(&ni) = pin_net.get(&(ci, pin_idx)) else { return 0.0 };
-                    let o: Vec<&(usize, i32, i32)> = pos[ni].iter().filter(|q| q.0 != ci).collect();
-                    if o.is_empty() {
-                        return 0.0;
-                    }
-                    let cx = o.iter().map(|q| q.1 as f64).sum::<f64>() / o.len() as f64;
-                    let cy = o.iter().map(|q| q.2 as f64).sum::<f64>() / o.len() as f64;
-                    (cx - x as f64).abs() + (cy - y as f64).abs()
-                };
-                let centroid = |pin_idx: usize| -> Option<(f64, f64)> {
-                    let ni = *pin_net.get(&(ci, pin_idx))?;
-                    let o: Vec<&(usize, i32, i32)> = pos[ni].iter().filter(|q| q.0 != ci).collect();
-                    if o.is_empty() {
-                        return None;
-                    }
-                    Some((o.iter().map(|q| q.1 as f64).sum::<f64>() / o.len() as f64, o.iter().map(|q| q.2 as f64).sum::<f64>() / o.len() as f64))
-                };
-                let (a, b) = (pins[0], pins[1]);
-                let now = dist(a.pin, a.x, a.y) + dist(b.pin, b.x, b.y);
-                let swapped = dist(a.pin, b.x, b.y) + dist(b.pin, a.x, a.y);
-                let mut gain = (now - swapped).round() as i32;
-                if gain.abs() <= 10 {
-                    // tie: the pin whose net lies further along the part's axis should point that way
-                    if let (Some(ca), Some(cb)) = (centroid(a.pin), centroid(b.pin)) {
-                        let (ux, uy) = ((a.x - b.x) as f64, (a.y - b.y) as f64);
-                        let l = (ux * ux + uy * uy).sqrt().max(1.0);
-                        let d = ((ca.0 - cb.0) * ux + (ca.1 - cb.1) * uy) / l;
-                        if d < -10.0 {
-                            gain = 11;
-                        }
-                    }
-                }
-                if gain > 10 && best.map(|b| gain > b.0).unwrap_or(true) {
-                    best = Some((gain, ci));
-                }
-            }
-            let Some((_, ci)) = best else { break };
-            let name = self.sch.components[ci].name.clone();
-            if flipped.contains(&name) {
-                break; // oscillation guard
-            }
-            let c = &mut self.sch.components[ci];
-            c.rotate = (c.rotate + 2) % 4;
-            self.default_label_pos(ci);
-            flipped.push(name);
-        }
-        flipped
+        Ok(json!({"nets_rerouted": out.len(), "failed": failed, "flipped": [], "improvement": gain, "labels_moved": relabeled}))
     }
 
     /// Wiring quality score used by the improvement pass (lower is better).
@@ -972,116 +858,6 @@ impl Doc {
         self.conn().pins.iter().map(|p| (p.x, p.y)).collect()
     }
 
-    // ------------------------------------------------------------------ simulation blocks
-
-    pub fn add_simulation(&mut self, kind: &str, params: &serde_json::Map<String, Value>, x: Option<i32>, y: Option<i32>) -> Result<String, String> {
-        let typ = match kind.to_ascii_lowercase().as_str() {
-            "tr" | "tran" | "transient" => ".TR",
-            "ac" => ".AC",
-            "dc" | "op" => ".DC",
-            "sweep" | "sw" | "param" => ".SW",
-            "noise" => ".NOISE",
-            "fourier" | "four" => ".FOURIER",
-            "sp" | "s-param" => ".SP",
-            "hb" => ".HB",
-            "pz" => ".PZ",
-            "disto" => ".DISTO",
-            "sens" => ".SENS",
-            "fft" => ".FFT",
-            k if k.starts_with('.') => return self.add_simulation(&k[1..], params, x, y),
-            other => return Err(format!("unknown simulation kind '{other}' (tr, ac, dc, sweep, noise, fourier, sp, hb, pz, disto, sens, fft)")),
-        };
-        let conn = self.conn();
-        let (bx, by) = match (x, y) {
-            (Some(x), Some(y)) => (x, y),
-            _ => {
-                // below the circuit, next to existing simulation blocks
-                let mut maxy = 0.0f64;
-                let mut minx = f64::MAX;
-                for p in &conn.placed {
-                    maxy = maxy.max(p.bbox[3]);
-                    minx = minx.min(p.bbox[0]);
-                    if let Some(l) = p.label_bbox {
-                        maxy = maxy.max(l[3]);
-                    }
-                }
-                let sims: Vec<&Component> = self.sch.components.iter().filter(|c| c.typ.starts_with('.')).collect();
-                if let Some(last) = sims.iter().max_by_key(|c| c.x) {
-                    (last.x + 200, last.y)
-                } else {
-                    let minx = if minx == f64::MAX { 60.0 } else { minx };
-                    (snap(minx as i32), snap(maxy as i32 + 60))
-                }
-            }
-        };
-        let prefix = library::name_prefix(typ);
-        let name = self.unique(&prefix.to_ascii_uppercase());
-        let mut c = library::new_component(typ, &name, snap(bx), snap(by))?;
-        apply_props(&mut c, params)?;
-        // show the properties that were set explicitly
-        if let Some(info) = lib().info(typ) {
-            for k in params.keys() {
-                if let Some(i) = info.props.iter().position(|p| p.name.eq_ignore_ascii_case(k)) {
-                    if let Some(p) = c.props.get_mut(i) {
-                        p.display = "1".into();
-                    }
-                }
-            }
-        }
-        self.sch.components.push(c);
-        Ok(name)
-    }
-}
-
-impl Doc {
-    /// Parameter sweep (.SW) over `param` for the analysis `sim` (e.g. "TR1", "AC1", "DC1").
-    /// `param` may be a component name (its main value is swept, e.g. "R1", "V1") or a
-    /// variable; a missing variable is created in a .PARAM block with `default`.
-    pub fn add_parameter_sweep(&mut self, sim: &str, param: &str, start: &str, stop: &str, points: &str, typ: &str, default: Option<&str>) -> Result<String, String> {
-        if !self.sch.components.iter().any(|c| c.name == sim && c.typ.starts_with('.')) {
-            let sims: Vec<String> = self.sch.components.iter().filter(|c| c.typ.starts_with('.') && c.typ != ".SW").map(|c| c.name.clone()).collect();
-            return Err(format!("no simulation '{sim}'. Available: {}", sims.join(", ")));
-        }
-        let is_comp = self.sch.component(param).is_some() || param.eq_ignore_ascii_case("temp");
-        if !is_comp {
-            let defined = self.sch.components.iter().any(|c| (c.typ == "SpicePar" || c.typ == "Eqn") && c.props.iter().any(|p| p.value.split('=').next().map(|n| n.trim() == param).unwrap_or(false)));
-            if !defined {
-                let mut m = serde_json::Map::new();
-                m.insert(param.to_string(), json!(default.unwrap_or(start)));
-                match self.sch.components.iter().position(|c| c.typ == "SpicePar") {
-                    Some(i) => apply_props(&mut self.sch.components[i], &m)?,
-                    None => {
-                        let (x, y) = self.free_spot();
-                        let n = self.add_component("SpicePar", None, x, y, None, None, &serde_json::Map::new())?;
-                        let i = self.sch.component_index(&n).unwrap();
-                        self.sch.components[i].props.clear();
-                        apply_props(&mut self.sch.components[i], &m)?;
-                    }
-                }
-            }
-        }
-        let mut p = serde_json::Map::new();
-        for (k, v) in [("Sim", sim), ("Type", typ), ("Param", param), ("Start", start), ("Stop", stop), ("Points", points)] {
-            p.insert(k.into(), json!(v));
-        }
-        self.add_simulation("sweep", &p, None, None)
-    }
-
-    /// A free spot below the circuit for text blocks.
-    fn free_spot(&self) -> (i32, i32) {
-        let conn = self.conn();
-        let mut maxy = 0.0f64;
-        let mut maxx = 0.0f64;
-        for p in &conn.placed {
-            maxy = maxy.max(p.bbox[3]);
-            maxx = maxx.max(p.bbox[2]);
-        }
-        let sims = self.sch.components.iter().filter(|c| c.typ.starts_with('.')).map(|c| c.x).max();
-        match sims {
-            Some(x) => (snap(x + 200), snap(self.sch.components.iter().filter(|c| c.typ.starts_with('.')).map(|c| c.y).max().unwrap_or(0))),
-            None => (snap(maxx as i32 + 80), snap(maxy as i32 + 60)),
-        }
-    }
 }
 
 fn arrive_for(dir: Option<(i32, i32)>) -> Arrive {
@@ -1116,29 +892,10 @@ fn overlap(a: &[f64; 4], b: &[f64; 4]) -> f64 {
     w * h
 }
 
-/// Set properties from a JSON object (`{"R": "10k", "Temp": "27"}`); `"name": {"value": .., "show": bool}` also works.
+/// Set properties from a JSON object (`{"R [K/W]": "2"}`); `"name": {"value": .., "show": bool}` also works.
 pub fn apply_props(c: &mut Component, props: &serde_json::Map<String, Value>) -> Result<(), String> {
     let info = lib().info(&c.typ);
     for (k, v) in props {
-        if c.typ == "Lib" || c.typ == "Sub" {
-            if c.typ == "Lib" && (k == "Lib" || k == "Comp") {
-                continue; // fixed when the component is created
-            }
-            let val = match v {
-                Value::String(s) => s.clone(),
-                Value::Object(o) => o.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                other => other.to_string(),
-            };
-            let n = c.props.len();
-            match (0..n).find(|&i| crate::qlib::param_name(c, i, None).map(|p| p.eq_ignore_ascii_case(k)).unwrap_or(false)) {
-                Some(i) => c.props[i].value = val,
-                None => {
-                    let names: Vec<String> = (0..n).filter_map(|i| crate::qlib::param_name(c, i, None)).collect();
-                    return Err(format!("{} has no parameter '{k}'. Parameters: {}", c.name, names.join(", ")));
-                }
-            }
-            continue;
-        }
         let (val, show) = match v {
             Value::String(s) => (s.clone(), None),
             Value::Number(n) => (n.to_string(), None),
@@ -1149,7 +906,6 @@ pub fn apply_props(c: &mut Component, props: &serde_json::Map<String, Value>) ->
             ),
             other => (other.to_string(), None),
         };
-        let text_block = library::is_text_block(&c.typ);
         let idx = info.and_then(|i| i.props.iter().position(|p| p.name.eq_ignore_ascii_case(k)));
         match idx {
             Some(i) => {
@@ -1164,17 +920,6 @@ pub fn apply_props(c: &mut Component, props: &serde_json::Map<String, Value>) ->
                 };
                 if let Some(s) = show {
                     c.props[i].display = if s { "1" } else { "0" }.into();
-                }
-            }
-            None if text_block => {
-                // equation-like blocks: "name=value" entries
-                let entry = format!("{k}={val}");
-                if let Some(p) = c.props.iter_mut().find(|p| p.value.split('=').next() == Some(k.as_str())) {
-                    p.value = entry;
-                } else {
-                    // insert before trailing non-equation options (e.g. Eqn "Export")
-                    let pos = c.props.iter().rposition(|p| p.value.contains('=')).map(|i| i + 1).unwrap_or(c.props.len());
-                    c.props.insert(pos, Prop { value: entry, display: "1".into() });
                 }
             }
             None => {
@@ -1281,9 +1026,9 @@ mod disk_tests {
     use super::*;
 
     fn new_test_doc(name: &str) -> (PathBuf, Doc) {
-        let folder = std::env::temp_dir().join(format!("qucs-rs-{name}-{}", std::process::id()));
-        let path = folder.join("test.sch");
-        let mut doc = Doc::for_new_file(Schematic::new_empty("test"), path.clone());
+        let folder = std::env::temp_dir().join(format!("qucs-t-{name}-{}", std::process::id()));
+        let path = folder.join("test.qucst");
+        let mut doc = Doc::for_new_file(crate::thermal::empty(), path.clone());
         doc.save().unwrap();
         (path, doc)
     }
@@ -1311,10 +1056,12 @@ mod disk_tests {
         let draft = local.save_conflict_draft().unwrap();
         let draft_again = local.save_conflict_draft().unwrap();
         assert_ne!(draft, draft_again);
+        assert_eq!(draft.file_name().unwrap(), "test.local-draft.qucst");
+        assert_eq!(draft_again.file_name().unwrap(), "test.local-draft-2.qucst");
         assert_eq!(Doc::open(&draft).unwrap().sch.properties, local.sch.properties);
         assert_eq!(Doc::open(&path).unwrap().sch.properties, external.sch.properties);
 
-        let copy = path.with_file_name("copy.sch");
+        let copy = path.with_file_name("copy.qucst");
         local.save_as(copy.clone()).unwrap();
         assert!(!local.dirty);
         assert!(local.external_change().unwrap().is_none());

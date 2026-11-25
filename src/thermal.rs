@@ -3,9 +3,7 @@
 use crate::netlist::{Connectivity, Dsu};
 use crate::schematic::{Component, Prop, Schematic};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
-pub const VERSION: &str = "thermal:1";
 pub const OFFSET: f64 = 273.15;
 pub const CYLINDER_AXIAL: &str = "円筒・軸方向";
 pub const CYLINDER_RADIAL: &str = "円筒・半径方向";
@@ -95,18 +93,7 @@ pub fn property_fields(component: &Component) -> Option<&'static [usize]> {
 }
 
 pub fn empty() -> Schematic {
-    Schematic {
-        version: VERSION.into(),
-        ..Schematic::new_empty("untitled")
-    }
-}
-
-pub fn open_doc(path: &Path) -> Result<crate::doc::Doc, String> {
-    let doc = crate::doc::Doc::open(path)?;
-    if doc.sch.version != VERSION {
-        return Err("Qucs-T の熱回路ファイル (.qucst) を指定してください".into());
-    }
-    Ok(doc)
+    Schematic::new_empty()
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -1016,7 +1003,7 @@ mod tests {
     }
 
     fn build(sch: &Schematic) -> Network {
-        Network::build(sch, &Connectivity::build(sch, None)).unwrap()
+        Network::build(sch, &Connectivity::build(sch)).unwrap()
     }
 
     fn near(actual: f64, expected: f64, tolerance: f64) {
@@ -1260,15 +1247,15 @@ mod tests {
         sch.wires.push(Wire::new(-90, 0, -30, 0));
         sch.components[r].props[0].value = "別の \"表示名\"".into();
         assert_eq!(Schematic::parse(&sch.serialize()).unwrap(), sch);
-        let pins = place(&sch.components[r], None).pins;
+        let pins = place(&sch.components[r]).pins;
         for typ in &PARTS[1..4] {
-            let other = place(&new_component(typ, "X", 0, 0).unwrap(), None);
+            let other = place(&new_component(typ, "X", 0, 0).unwrap());
             assert_eq!(
                 other.pins.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(),
                 pins.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>()
             );
         }
-        let net = Connectivity::build(&sch, None);
+        let net = Connectivity::build(&sch);
         let node = net.pins.iter().find(|pin| pin.comp == c).unwrap().net;
         let network = build(&sch);
         let steady = network.steady().unwrap();

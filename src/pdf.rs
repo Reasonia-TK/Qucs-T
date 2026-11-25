@@ -53,7 +53,7 @@ pub fn image_pdf(w: u32, h: u32, rgba: &[u8], title: &str) -> Result<Vec<u8>, St
     cs.extend_from_slice(content.as_bytes());
     cs.extend_from_slice(b"endstream");
     obj(&mut out, &cs);
-    obj(&mut out, format!("<< /Title ({}) /Producer (qucs-s-rs {}) >>", pdf_string(title), env!("CARGO_PKG_VERSION")).as_bytes());
+    obj(&mut out, format!("<< /Title ({}) /Producer (qucs-t {}) >>", pdf_string(title), env!("CARGO_PKG_VERSION")).as_bytes());
     let xref = out.len();
     let mut x = format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1);
     for o in &offsets {
@@ -113,6 +113,7 @@ mod tests {
         assert!(text.starts_with("%PDF-1.4"));
         assert!(text.trim_end().ends_with("%%EOF"));
         assert!(text.contains("/Width 40 /Height 20"));
+        assert!(text.contains(concat!("/Producer (qucs-t ", env!("CARGO_PKG_VERSION"), ")")));
         assert!(text.contains("/Title (t \\(1\\))"));
         // landscape page for a wide image
         assert!(text.contains("/MediaBox [0 0 841.89 595.28]"));
@@ -134,8 +135,8 @@ mod tests {
 
     #[test]
     fn schematic_to_pdf() {
-        let d = crate::doc::Doc::open(std::path::Path::new("examples/inverting_amp.sch")).unwrap();
-        let pdf = schematic_pdf(&d.sch, &d.conn(), "inverting_amp").unwrap();
+        let d = crate::doc::Doc::open(std::path::Path::new("examples/heatsink.qucst")).unwrap();
+        let pdf = schematic_pdf(&d.sch, &d.conn(), "heatsink").unwrap();
         assert!(pdf.len() > 2000);
     }
 }

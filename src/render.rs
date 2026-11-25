@@ -117,22 +117,6 @@ pub fn prim_shapes(p: &Prim, out: &mut Vec<Shape>, override_color: Option<Color>
             width: pen_width(pen.width),
             dash: pen.style.contains("Dash") || pen.style.contains("Dot"),
         }),
-        Prim::Arc { x, y, w, h, angle, arclen, pen } => out.push(Shape::Poly {
-            pts: arc_points(*x, *y, *w, *h, *angle, *arclen),
-            color: col(&pen.color),
-            width: pen_width(pen.width),
-            fill: None,
-            closed: false,
-            dash: false,
-        }),
-        Prim::Rect { x, y, w, h, pen, brush } => out.push(Shape::Poly {
-            pts: vec![(*x, *y), (x + w, *y), (x + w, y + h), (*x, y + h)],
-            color: col(&pen.color),
-            width: pen_width(pen.width),
-            fill: brush.as_ref().filter(|b| b.as_str() != "none").map(|b| col(b)),
-            closed: true,
-            dash: pen.style.contains("Dash"),
-        }),
         Prim::Ellipse { x, y, w, h, pen, brush } => out.push(Shape::Ellipse {
             c: (x + w / 2.0, y + h / 2.0),
             rx: w / 2.0,
@@ -141,29 +125,6 @@ pub fn prim_shapes(p: &Prim, out: &mut Vec<Shape>, override_color: Option<Color>
             width: if pen.color == "none" { 0.0 } else { pen_width(pen.width) },
             fill: brush.as_ref().filter(|b| b.as_str() != "none").map(|b| col(b)),
         }),
-        Prim::Polyline { points, pen, brush } => out.push(Shape::Poly {
-            pts: points.iter().map(|q| (q[0], q[1])).collect(),
-            color: col(&pen.color),
-            width: if pen.color == "none" { 0.0 } else { pen_width(pen.width) },
-            fill: brush.as_ref().filter(|b| b.as_str() != "none").map(|b| col(b)),
-            closed: brush.is_some(),
-            dash: false,
-        }),
-        Prim::Text { x, y, s, color, size, mcos, msin } => {
-            let (c, bold) = match color.split_once('|') {
-                Some((c, b)) => (c, b == "bold"),
-                None => (color.as_str(), false),
-            };
-            out.push(Shape::Text {
-                pos: (*x, *y),
-                text: s.clone(),
-                size: *size,
-                color: override_color.unwrap_or_else(|| Color::parse(c)),
-                bold,
-                angle: -msin.atan2(*mcos).to_degrees(),
-                bg: None,
-            })
-        }
     }
 }
 
@@ -191,9 +152,6 @@ pub fn build_scene(sch: &Schematic, conn: &Connectivity, ov: &Overlay) -> Scene 
     for line in &sch.paintings {
         painting_shapes(line, &mut sc);
     }
-
-    // embedded result diagrams (<Diagrams>): frame, grid and trace names like Qucs-S
-    diagram_shapes(&sch.diagrams, &mut sc);
 
     // wires
     for (wi, w) in sch.wires.iter().enumerate() {
@@ -225,9 +183,9 @@ pub fn build_scene(sch: &Schematic, conn: &Connectivity, ov: &Overlay) -> Scene 
         for prim in &p.prims {
             prim_shapes(prim, &mut sc.shapes, ov_col);
         }
-        if c.active & 3 != 1 {
+        if off {
             let b = p.bbox;
-            let col = if off { Color::RED } else { Color(0, 128, 0, 255) };
+            let col = Color::RED;
             sc.push(Shape::Line { a: (b[0], b[1]), b: (b[2], b[3]), color: col, width: 1.0, dash: false });
             sc.push(Shape::Line { a: (b[0], b[3]), b: (b[2], b[1]), color: col, width: 1.0, dash: false });
         }
@@ -336,76 +294,6 @@ pub fn build_scene(sch: &Schematic, conn: &Connectivity, ov: &Overlay) -> Scene 
         sc.bounds = [0.0, 0.0, 400.0, 300.0];
     }
     sc
-}
-
-/// Qucs diagrams: `<Rect x y w h ...>` (x, y = lower-left corner) followed by
-/// `<"dataset/vector" color ...>` graph lines and `</Rect>`.
-fn diagram_shapes(lines: &[String], sc: &mut Scene) {
-    let mut cur: Option<(String, f64, f64, f64, f64, Vec<(String, Color)>)> = None;
-    let flush = |d: (String, f64, f64, f64, f64, Vec<(String, Color)>), sc: &mut Scene| {
-        let (kind, x, y, w, h, graphs) = d;
-        let top = y - h;
-        let frame = Color(0x60, 0x60, 0x60, 255);
-        let grid = Color(0xd0, 0xd0, 0xd0, 255);
-        match kind.as_str() {
-            "Smith" | "Polar" | "PS" | "SP" => {
-                let r = w.min(h) / 2.0;
-                let c = (x + w / 2.0, top + h / 2.0);
-                sc.push(Shape::Ellipse { c, rx: r, ry: r, color: frame, width: 1.0, fill: Some(Color(255, 255, 255, 255)) });
-                for k in [0.25, 0.5, 0.75] {
-                    sc.push(Shape::Ellipse { c: (c.0 + r * k, c.1), rx: r * (1.0 - k), ry: r * (1.0 - k), color: grid, width: 1.0, fill: None });
-                }
-                sc.push(Shape::Line { a: (c.0 - r, c.1), b: (c.0 + r, c.1), color: grid, width: 1.0, dash: false });
-            }
-            _ => {
-                sc.push(Shape::Poly { pts: vec![(x, top), (x + w, top), (x + w, y), (x, y)], color: frame, width: 1.0, fill: Some(Color(255, 255, 255, 255)), closed: true, dash: false });
-                if kind != "Tab" {
-                    for k in 1..10 {
-                        let gx = x + w * k as f64 / 10.0;
-                        sc.push(Shape::Line { a: (gx, top), b: (gx, y), color: grid, width: 1.0, dash: false });
-                    }
-                    for k in 1..5 {
-                        let gy = top + h * k as f64 / 5.0;
-                        sc.push(Shape::Line { a: (x, gy), b: (x + w, gy), color: grid, width: 1.0, dash: false });
-                    }
-                }
-            }
-        }
-        for (k, (name, col)) in graphs.iter().enumerate() {
-            sc.push(Shape::Text { pos: (x + 6.0, top + 4.0 + k as f64 * 16.0), text: name.clone(), size: 12.0, color: *col, bold: false, angle: 0.0, bg: Some(Color(255, 255, 255, 220)) });
-        }
-        sc.push(Shape::Text { pos: (x + 6.0, y - 18.0), text: "（シミュレーション結果は結果ウィンドウ / plot_results で表示）".into(), size: 10.0, color: Color(150, 150, 150, 255), bold: false, angle: 0.0, bg: None });
-        sc.grow(x, top);
-        sc.grow(x + w, y);
-    };
-    for raw in lines {
-        let l = raw.trim();
-        if l.starts_with("</") {
-            if let Some(d) = cur.take() {
-                flush(d, sc);
-            }
-            continue;
-        }
-        if let Some(rest) = l.strip_prefix("<\"") {
-            if let Some(d) = cur.as_mut() {
-                let name = rest.split('"').next().unwrap_or("").to_string();
-                let col = l.split_whitespace().nth(1).map(Color::parse).unwrap_or(Color::WIRE);
-                d.5.push((name, col));
-            }
-            continue;
-        }
-        let t = painting_tokens(l);
-        if t.len() >= 5 {
-            let f = |i: usize| t[i].parse::<f64>().unwrap_or(0.0);
-            if let Some(d) = cur.take() {
-                flush(d, sc);
-            }
-            cur = Some((t[0].clone(), f(1), f(2), f(3), f(4), Vec::new()));
-        }
-    }
-    if let Some(d) = cur.take() {
-        flush(d, sc);
-    }
 }
 
 fn painting_shapes(line: &str, sc: &mut Scene) {

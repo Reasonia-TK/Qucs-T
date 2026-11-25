@@ -1,105 +1,55 @@
-//! Component database (properties, pins) and symbol geometry ported from Qucs-S.
-//!
-//! `data/components.json` – property names/defaults/descriptions and pins (measured with qucs-s)
-//! `data/symbols.json`    – drawing primitives extracted from the Qucs-S C++ sources
-//!                          (see tools/extract_symbols.py)
+//! Thermal component definitions and schematic symbol geometry.
 
-use crate::schematic::{Component, Schematic};
-use serde::Deserialize;
+use crate::schematic::Component;
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::OnceLock;
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct PropInfo {
     pub name: String,
     pub default: String,
-    #[serde(default)]
     pub display: bool,
-    #[serde(default)]
     pub description: String,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct CompInfo {
-    #[serde(rename = "type")]
     pub typ: String,
-    #[serde(default)]
     pub caption: String,
-    #[serde(default)]
     pub description: String,
-    #[serde(default)]
     pub category: String,
-    #[serde(default)]
     pub prefix: String,
-    #[serde(default)]
-    pub template: String,
-    #[serde(default)]
     pub props: Vec<PropInfo>,
-    #[serde(default)]
-    pub pins: Option<Vec<[f64; 2]>>,
-    #[serde(default)]
-    pub pin_names: Option<Vec<String>>,
-    #[serde(default)]
-    pub ngspice: bool,
+    pub pin_names: Vec<String>,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct Pen {
     pub color: String,
     pub width: f64,
-    #[serde(default)]
     pub style: String,
 }
 
-#[derive(Deserialize, Clone, Debug)]
-#[serde(tag = "k", rename_all = "lowercase")]
+#[derive(Clone, Debug)]
 pub enum Prim {
     Line { x1: f64, y1: f64, x2: f64, y2: f64, pen: Pen },
-    Arc { x: f64, y: f64, w: f64, h: f64, angle: i32, arclen: i32, pen: Pen },
-    Rect { x: f64, y: f64, w: f64, h: f64, pen: Pen, brush: Option<String> },
     Ellipse { x: f64, y: f64, w: f64, h: f64, pen: Pen, brush: Option<String> },
-    Polyline { points: Vec<[f64; 2]>, pen: Pen, brush: Option<String> },
-    Text { x: f64, y: f64, s: String, color: String, size: f64, mcos: f64, msin: f64 },
 }
 
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SymbolShape {
-    #[serde(default)]
     pub prims: Vec<Prim>,
-    #[serde(default)]
     pub ports: Vec<[f64; 2]>,
-    #[serde(default)]
     pub bbox: [f64; 4],
-    #[serde(default)]
     pub tx: f64,
-    #[serde(default)]
     pub ty: f64,
-    #[serde(default)]
     pub rotated: i32,
 }
 
-#[derive(Deserialize, Clone, Debug)]
-pub struct Variant {
-    pub when: HashMap<String, String>,
-    #[serde(flatten)]
-    pub shape: SymbolShape,
-}
-
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SymbolDef {
-    #[serde(flatten)]
     pub shape: SymbolShape,
-    #[serde(default)]
-    pub variants: Vec<Variant>,
-    #[serde(default)]
     pub pin_names: Vec<String>,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub color: Option<String>,
 }
 
 pub struct Library {
@@ -112,16 +62,8 @@ static LIB: OnceLock<Library> = OnceLock::new();
 
 pub fn lib() -> &'static Library {
     LIB.get_or_init(|| {
-        let comps_map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(include_str!("../data/components.json")).expect("components.json");
         let mut comps = Vec::new();
-        for (_, v) in comps_map {
-            if let Ok(c) = serde_json::from_value::<CompInfo>(v) {
-                comps.push(c);
-            }
-        }
-        let mut symbols: HashMap<String, SymbolDef> =
-            serde_json::from_str(include_str!("../data/symbols.json")).expect("symbols.json");
+        let mut symbols = HashMap::new();
         add_thermal_parts(&mut comps, &mut symbols);
         let by_type = comps.iter().enumerate().map(|(i, c)| (c.typ.clone(), i)).collect();
         Library { comps, by_type, symbols }
@@ -131,7 +73,6 @@ pub fn lib() -> &'static Library {
 fn add_thermal_parts(comps: &mut Vec<CompInfo>, symbols: &mut HashMap<String, SymbolDef>) {
     use crate::thermal::{CYLINDER_AXIAL, CYLINDER_RADIAL, PLANAR_CONDUCTION};
 
-    let resistor = symbols["R"].clone();
     let pen = Pen { color: "#000080".into(), width: 2.0, style: "SolidLine".into() };
     let line = |x1, y1, x2, y2| Prim::Line { x1, y1, x2, y2, pen: pen.clone() };
     let prop = |name: &str, default: &str, display, description: &str| PropInfo {
@@ -161,9 +102,25 @@ fn add_thermal_parts(comps: &mut Vec<CompInfo>, symbols: &mut HashMap<String, Sy
                 prop("伝熱距離 [mm]", "10", false, "板の厚さなど、熱が流れる方向の距離"),
                 prop("断面積 [mm²]", "100", false, "熱流に垂直な断面積"),
             ]);
-            let mut symbol = resistor.clone();
-            symbol.pin_names = vec!["1".into(), "2".into()];
-            symbol
+            // Retain the Qucs-S rectangular resistor geometry for all thermal branches.
+            SymbolDef {
+                shape: SymbolShape {
+                    prims: vec![
+                        line(-18.0, -9.0, 18.0, -9.0),
+                        line(18.0, -9.0, 18.0, 9.0),
+                        line(18.0, 9.0, -18.0, 9.0),
+                        line(-18.0, 9.0, -18.0, -9.0),
+                        line(-30.0, 0.0, -18.0, 0.0),
+                        line(18.0, 0.0, 30.0, 0.0),
+                    ],
+                    ports: vec![[-30.0, 0.0], [30.0, 0.0]],
+                    bbox: [-30.0, -11.0, 30.0, 11.0],
+                    tx: -26.0,
+                    ty: 15.0,
+                    rotated: 0,
+                },
+                pin_names: vec!["1".into(), "2".into()],
+            }
         } else {
             let mut prims = vec![line(0.0, -30.0, 0.0, -10.0)];
             match typ {
@@ -207,14 +164,12 @@ fn add_thermal_parts(comps: &mut Vec<CompInfo>, symbols: &mut HashMap<String, Sy
             SymbolDef {
                 shape: SymbolShape { prims, ports: vec![[0.0, -30.0]], bbox: [-14.0, -10.0, 14.0, 10.0], tx: 18.0, ty: -12.0, rotated: 0 },
                 pin_names: vec!["1".into()],
-                ..SymbolDef::default()
-            }
+                    }
         };
         let prefix = ["Rth", "Rc", "H", "Rad", "Cth", "P", "T", "Rax", "Rrad"][i];
         comps.push(CompInfo {
             typ: typ.into(), caption: label.into(), description: descriptions[i].into(), category: "thermal".into(),
-            prefix: prefix.into(), template: String::new(), props, pins: Some(symbol.shape.ports.clone()),
-            pin_names: Some(symbol.pin_names.clone()), ngspice: false,
+            prefix: prefix.into(), props, pin_names: symbol.pin_names.clone(),
         });
         symbols.insert(typ.into(), symbol);
     }
@@ -279,7 +234,6 @@ pub struct PlacedPin {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct Placed {
     pub prims: Vec<Prim>, // absolute coordinates
     pub pins: Vec<PlacedPin>,
@@ -289,15 +243,6 @@ pub struct Placed {
     pub label_lines: Vec<String>,
     pub label_pos: (f64, f64),
     pub label_bbox: Option<[f64; 4]>,
-    pub kind: SymbolKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SymbolKind {
-    Normal,
-    Simulation,
-    TextBlock,
-    Generic,
 }
 
 fn qucs_rotate_shape(prims: &mut [Prim], ports: &mut [[f64; 2]], bbox: &mut [f64; 4]) {
@@ -311,34 +256,11 @@ fn qucs_rotate_shape(prims: &mut [Prim], ports: &mut [[f64; 2]], bbox: &mut [f64
                 *x2 = a;
                 *y2 = b;
             }
-            Prim::Arc { x, y, w, h, angle, .. } => {
+            Prim::Ellipse { x, y, w, h, .. } => {
                 let (nx, ny) = (*y, -*x - *w);
                 *x = nx;
                 *y = ny;
                 std::mem::swap(w, h);
-                *angle += 16 * 90;
-                if *angle >= 16 * 360 {
-                    *angle -= 16 * 360;
-                }
-            }
-            Prim::Rect { x, y, w, h, .. } | Prim::Ellipse { x, y, w, h, .. } => {
-                let (nx, ny) = (*y, -*x - *w);
-                *x = nx;
-                *y = ny;
-                std::mem::swap(w, h);
-            }
-            Prim::Polyline { points, .. } => {
-                for q in points.iter_mut() {
-                    *q = [q[1], -q[0]];
-                }
-            }
-            Prim::Text { x, y, mcos, msin, .. } => {
-                let (nx, ny) = (*y, -*x);
-                *x = nx;
-                *y = ny;
-                let (c, s) = (-*msin, *mcos);
-                *msin = s;
-                *mcos = c;
             }
         }
     }
@@ -356,27 +278,7 @@ fn qucs_mirror_shape(prims: &mut [Prim], ports: &mut [[f64; 2]], bbox: &mut [f64
                 *y1 = -*y1;
                 *y2 = -*y2;
             }
-            Prim::Arc { y, h, angle, arclen, .. } => {
-                *y = -*y - *h;
-                if *angle > 16 * 180 {
-                    *angle -= 16 * 360;
-                }
-                *angle = -*angle;
-                *angle -= *arclen;
-                if *angle < 0 {
-                    *angle += 16 * 360;
-                }
-            }
-            Prim::Rect { y, h, .. } | Prim::Ellipse { y, h, .. } => *y = -*y - *h,
-            Prim::Polyline { points, .. } => {
-                for q in points.iter_mut() {
-                    q[1] = -q[1];
-                }
-            }
-            Prim::Text { y, s, size, mcos, msin, .. } => {
-                let (w, h) = text_size(s, *size);
-                *y = -*y - (mcos.trunc()) * h + (msin.trunc()) * w;
-            }
+            Prim::Ellipse { y, h, .. } => *y = -*y - *h,
         }
     }
     for q in ports.iter_mut() {
@@ -394,40 +296,22 @@ fn translate(p: &mut Prim, dx: f64, dy: f64) {
             *y1 += dy;
             *y2 += dy;
         }
-        Prim::Arc { x, y, .. } | Prim::Rect { x, y, .. } | Prim::Ellipse { x, y, .. } | Prim::Text { x, y, .. } => {
+        Prim::Ellipse { x, y, .. } => {
             *x += dx;
             *y += dy;
-        }
-        Prim::Polyline { points, .. } => {
-            for q in points.iter_mut() {
-                q[0] += dx;
-                q[1] += dy;
-            }
         }
     }
 }
 
 /// Property name for display (`R=10k`).
 pub fn prop_name(c: &Component, i: usize) -> String {
-    if let Some(n) = crate::qlib::param_name(c, i, None) {
-        return n;
-    }
     let lib = lib();
     if let Some(info) = lib.info(&c.typ) {
         if let Some(p) = info.props.get(i) {
             return p.name.clone();
         }
-        // repeated trailing properties (Eqn y=..., SpicePar ...)
-        if let Some(p) = info.props.last() {
-            return p.name.clone();
-        }
     }
     format!("p{}", i + 1)
-}
-
-pub fn is_text_block(typ: &str) -> bool {
-    lib().symbols.get(typ).map(|s| s.title.is_some() && s.shape.prims.is_empty()).unwrap_or(false)
-        || typ == "Eqn"
 }
 
 /// Text lines shown next to a component (name + displayed properties).
@@ -436,7 +320,6 @@ pub fn label_lines(c: &Component) -> Vec<String> {
     if c.show_name() && c.name != "*" && !c.name.is_empty() {
         lines.push(c.name.clone());
     }
-    let text_block = is_text_block(&c.typ);
     let branch_fields = crate::thermal::property_fields(c);
     for (i, p) in c.props.iter().enumerate() {
         if !p.visible() || branch_fields.is_some_and(|fields| !fields.contains(&i)) {
@@ -448,156 +331,29 @@ pub fn label_lines(c: &Component) -> Vec<String> {
             }
             continue;
         }
-        if text_block && p.value.contains('=') {
-            lines.push(p.value.clone());
-        } else if text_block && c.typ == "NutmegEq" && i == 0 {
-            lines.push(format!("Simulation={}", p.value));
-        } else {
-            lines.push(format!("{}={}", prop_name(c, i), p.value));
-        }
+        lines.push(format!("{}={}", prop_name(c, i), p.value));
     }
     lines
 }
 
-fn pick_shape<'a>(def: &'a SymbolDef, c: &Component) -> &'a SymbolShape {
-    if def.variants.is_empty() {
-        return &def.shape;
-    }
-    let info = lib().info(&c.typ);
-    let value_of = |name: &str| -> Option<String> {
-        let info = info?;
-        let idx = info.props.iter().position(|p| p.name == name)?;
-        Some(c.props.get(idx).map(|p| p.value.clone()).unwrap_or_else(|| info.props[idx].default.clone()))
-    };
-    for v in &def.variants {
-        if v.when.iter().all(|(k, val)| {
-            let cur = value_of(k).unwrap_or_default();
-            if k == "in" {
-                let n: i32 = cur.trim().parse().unwrap_or(2);
-                n.clamp(2, 8).to_string() == *val
-            } else {
-                cur.trim() == val
-            }
-        }) {
-            return &v.shape;
-        }
-    }
-    &def.shape
-}
-
-fn wrap_label(label: &str) -> String {
-    // like SimulationComponent::wrapLabel – break near every 14th character
-    let words: Vec<&str> = label.split_whitespace().collect();
-    let mut out = String::new();
-    let mut cur = String::new();
-    for w in words {
-        if !cur.is_empty() && cur.len() + 1 + w.len() > 16 {
-            out.push_str(&cur);
-            out.push('\n');
-            cur.clear();
-        }
-        if !cur.is_empty() {
-            cur.push(' ');
-        }
-        cur.push_str(w);
-    }
-    out.push_str(&cur);
-    out
-}
-
-const SIM_FONT: f64 = 16.0;
-
 /// Geometry of a component placed in a schematic (absolute coordinates).
-pub fn place(c: &Component, sch_dir: Option<&Path>) -> Placed {
-    let lib = lib();
-    let def = lib.symbols.get(&c.typ);
-    let mut kind = SymbolKind::Normal;
-    let ext = match c.typ.as_str() {
-        "Lib" => crate::qlib::lib_symbol(c),
-        "Sub" => crate::qlib::sub_symbol(c, sch_dir),
-        _ => None,
-    };
-    let (mut prims, mut ports, mut bbox, rotated) = match def {
-        _ if ext.is_some() => {
-            let s = &ext.as_ref().unwrap().shape;
-            (s.prims.clone(), s.ports.clone(), s.bbox, 0)
-        }
-        Some(d) if !d.shape.prims.is_empty() => {
-            let s = pick_shape(d, c);
-            (s.prims.clone(), s.ports.clone(), s.bbox, s.rotated)
-        }
-        Some(d) if c.typ.starts_with('.') => {
-            kind = SymbolKind::Simulation;
-            let label = wrap_label(d.description.as_deref().unwrap_or(&c.typ));
-            let (w, h) = text_size(&label, SIM_FONT);
-            let color = d.color.clone().unwrap_or_else(|| "#000080".into());
-            let pen = Pen { color: color.clone(), width: 2.0, style: "SolidLine".into() };
-            let (ax, ay, bw, bh) = (-5.0, -5.0, w + 10.0, h + 10.0);
-            let mut prims = vec![Prim::Rect { x: ax, y: ay, w: bw, h: bh, pen: pen.clone(), brush: None }];
-            let pts = vec![
-                [ax + bw, ay],
-                [ax + bw + 5.0, ay + 5.0],
-                [ax + bw + 5.0, ay + bh + 5.0],
-                [ax + 5.0, ay + bh + 5.0],
-                [ax, ay + bh],
-            ];
-            prims.push(Prim::Polyline { points: pts, pen: pen.clone(), brush: None });
-            prims.push(Prim::Line { x1: ax + bw, y1: ay + bh, x2: ax + bw + 5.0, y2: ay + bh + 5.0, pen: pen.clone() });
-            for (k, l) in label.split('\n').enumerate() {
-                prims.push(Prim::Text {
-                    x: 0.0,
-                    y: k as f64 * SIM_FONT * 1.25,
-                    s: l.to_string(),
-                    color: format!("{color}|bold"),
-                    size: SIM_FONT,
-                    mcos: 1.0,
-                    msin: 0.0,
-                });
-            }
-            (prims, vec![], [ax - 3.0, ay - 3.0, ax + bw + 8.0, ay + bh + 8.0], 0)
-        }
-        Some(d) if d.title.is_some() || c.typ == "Eqn" => {
-            kind = SymbolKind::TextBlock;
-            let title = d.title.clone().unwrap_or_else(|| "Equation".into());
-            let color = d.color.clone().unwrap_or_else(|| "#000080".into());
-            let (w, h) = text_size(&title, 16.0);
-            let (xb, yb) = ((w / 2.0).round(), (h / 2.0).round());
-            let pen = Pen { color: color.clone(), width: 2.0, style: "SolidLine".into() };
-            let prims = vec![
-                Prim::Line { x1: -xb, y1: -yb, x2: -xb, y2: yb, pen: pen.clone() },
-                Prim::Line { x1: -xb, y1: yb, x2: xb + 3.0, y2: yb, pen },
-                Prim::Text { x: -xb + 4.0, y: -yb - 3.0, s: title, color: "#000000".into(), size: 16.0, mcos: 1.0, msin: 0.0 },
-            ];
-            (prims, vec![], [-xb - 3.0, -yb - 5.0, xb + 9.0, yb + 3.0], 0)
-        }
-        _ => {
-            kind = SymbolKind::Generic;
-            generic_symbol(c, sch_dir)
-        }
-    };
+pub fn place(c: &Component) -> Placed {
+    let def = lib().symbols.get(&c.typ);
+    let mut shape = def.map(|symbol| symbol.shape.clone()).unwrap_or_default();
 
-    // Qucs load semantics: mirror first, then rotate from the constructor's orientation
-    let k = rotated & 3;
-    if kind == SymbolKind::Normal || kind == SymbolKind::Generic {
-        if c.mirror != 0 {
-            qucs_mirror_shape(&mut prims, &mut ports, &mut bbox);
-        }
-        let mut t = c.rotate & 3;
-        if k > t {
-            t += 4;
-        }
-        for _ in k..t {
-            qucs_rotate_shape(&mut prims, &mut ports, &mut bbox);
-        }
+    // Mirror first, then rotate from the symbol's default orientation.
+    if c.mirror != 0 {
+        qucs_mirror_shape(&mut shape.prims, &mut shape.ports, &mut shape.bbox);
     }
+    for _ in 0..(c.rotate - shape.rotated).rem_euclid(4) {
+        qucs_rotate_shape(&mut shape.prims, &mut shape.ports, &mut shape.bbox);
+    }
+    let SymbolShape { mut prims, ports, bbox, .. } = shape;
     let (cx, cy) = (c.x as f64, c.y as f64);
     for p in prims.iter_mut() {
         translate(p, cx, cy);
     }
-    let names = match &ext {
-        Some(e) => e.pin_names.clone(),
-        None => def.map(|d| d.pin_names.clone()).unwrap_or_default(),
-    };
+    let names = def.map(|symbol| symbol.pin_names.as_slice()).unwrap_or_default();
     let body = [bbox[0] + cx, bbox[1] + cy, bbox[2] + cx, bbox[3] + cy];
     let pins: Vec<PlacedPin> = ports
         .iter()
@@ -614,8 +370,7 @@ pub fn place(c: &Component, sch_dir: Option<&Path>) -> Placed {
         })
         .collect();
     let lines = label_lines(c);
-    // simulation blocks always put their text right below the box (SimulationComponent::updateComponentBounds)
-    let label_pos = if kind == SymbolKind::Simulation { (cx, cy + bbox[3]) } else { (cx + c.tx as f64, cy + c.ty as f64) };
+    let label_pos = (cx + c.tx as f64, cy + c.ty as f64);
     let label_bbox = if lines.is_empty() {
         None
     } else {
@@ -623,7 +378,7 @@ pub fn place(c: &Component, sch_dir: Option<&Path>) -> Placed {
         let h = lines.len() as f64 * LINE_H;
         Some([label_pos.0, label_pos.1, label_pos.0 + w, label_pos.1 + h])
     };
-    Placed { prims, pins, bbox: body, label_lines: lines, label_pos, label_bbox, kind }
+    Placed { prims, pins, bbox: body, label_lines: lines, label_pos, label_bbox }
 }
 
 /// Direction in which a wire should leave the pin: opposite to the symbol lead that ends there.
@@ -667,147 +422,30 @@ fn pin_direction(prims: &[Prim], x: i32, y: i32, body: &[f64; 4]) -> (i32, i32) 
     best.1
 }
 
-/// Box symbol for components whose geometry is dynamic (Sub, SPICE, Verilog ...).
-fn generic_symbol(c: &Component, sch_dir: Option<&Path>) -> (Vec<Prim>, Vec<[f64; 2]>, [f64; 4], i32) {
-    let lib = lib();
-    let pen = Pen { color: "#000080".into(), width: 2.0, style: "SolidLine".into() };
-    let mut ports: Vec<[f64; 2]> = lib
-        .info(&c.typ)
-        .and_then(|i| i.pins.clone())
-        .unwrap_or_default();
-    let mut title = c.typ.clone();
-    if c.typ == "Sub" {
-        if let Some(n) = subcircuit_port_count(c, sch_dir) {
-            ports = default_sub_ports(n);
-        }
-        if let Some(f) = c.props.first() {
-            title = Path::new(&f.value).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(title);
-        }
-    }
-    let (mut x1, mut y1, mut x2, mut y2) = (-20.0f64, -20.0f64, 20.0f64, 20.0f64);
-    for p in &ports {
-        x1 = x1.min(p[0] + 10.0);
-        x2 = x2.max(p[0] - 10.0);
-        y1 = y1.min(p[1] - 10.0);
-        y2 = y2.max(p[1] + 10.0);
-    }
-    if !ports.is_empty() {
-        let xs: Vec<f64> = ports.iter().map(|p| p[0]).collect();
-        let minx = xs.iter().cloned().fold(f64::MAX, f64::min);
-        let maxx = xs.iter().cloned().fold(f64::MIN, f64::max);
-        if maxx - minx >= 40.0 {
-            x1 = minx + 10.0;
-            x2 = maxx - 10.0;
-        }
-    }
-    let mut prims = vec![Prim::Rect { x: x1, y: y1, w: x2 - x1, h: y2 - y1, pen: pen.clone(), brush: None }];
-    for p in &ports {
-        let ex = p[0].clamp(x1, x2);
-        let ey = p[1].clamp(y1, y2);
-        if (ex, ey) != (p[0], p[1]) {
-            prims.push(Prim::Line { x1: p[0], y1: p[1], x2: ex, y2: ey, pen: pen.clone() });
-        }
-    }
-    let (tw, _) = text_size(&title, 10.0);
-    prims.push(Prim::Text {
-        x: (x1 + x2) / 2.0 - tw / 2.0,
-        y: (y1 + y2) / 2.0 - 7.0,
-        s: title,
-        color: "#000080".into(),
-        size: 10.0,
-        mcos: 1.0,
-        msin: 0.0,
-    });
-    (prims, ports, [x1 - 2.0, y1 - 2.0, x2 + 2.0, y2 + 2.0], 0)
-}
-
-fn subcircuit_port_count(c: &Component, sch_dir: Option<&Path>) -> Option<usize> {
-    let file = c.props.first()?.value.clone();
-    let p = Path::new(&file);
-    let path = if p.is_absolute() { p.to_path_buf() } else { sch_dir?.join(p) };
-    let sub = Schematic::load(&path).ok()?;
-    Some(sub.components.iter().filter(|k| k.typ == "Port").count())
-}
-
-/// Default Qucs subcircuit symbol pin layout (ports alternate left / right).
-fn default_sub_ports(n: usize) -> Vec<[f64; 2]> {
-    let mut out = Vec::new();
-    let h = 30.0 * (((n as f64) - 1.0) / 2.0).floor() + 15.0;
-    let mut yl = -h + 15.0;
-    let mut yr = -h + 15.0;
-    for i in 0..n {
-        if i % 2 == 0 {
-            out.push([-30.0, yl]);
-            yl += 30.0;
-        } else {
-            out.push([30.0, yr]);
-            yr += 30.0;
-        }
-    }
-    out
-}
-
 /// Build a fresh component of `typ` with default properties.
 pub fn new_component(typ: &str, name: &str, x: i32, y: i32) -> Result<Component, String> {
     let lib = lib();
     let info = lib.info(typ).ok_or_else(|| format!("unknown component type '{typ}' (see list_component_types)"))?;
-    let mut c = if !info.template.is_empty() {
-        Component::parse(&info.template)?
-    } else {
-        Component {
-            typ: typ.into(),
-            name: name.into(),
-            active: 1,
-            x: 0,
-            y: 0,
-            tx: 0,
-            ty: 0,
-            mirror: 0,
-            rotate: 0,
-            props: info
-                .props
-                .iter()
-                .map(|p| crate::schematic::Prop { value: p.default.clone(), display: if p.display { "1" } else { "0" }.into() })
-                .collect(),
-        }
-    };
-    c.name = name.to_string();
-    c.x = x;
-    c.y = y;
-    c.mirror = 0;
-    c.rotate = 0;
-    if let Some(s) = lib.symbols.get(typ) {
-        if !typ.starts_with('.') {
-            c.tx = s.shape.tx.round() as i32;
-            c.ty = s.shape.ty.round() as i32;
-        }
-        // symbols that are rotated by their constructor (voltage sources...) are
-        // vertical by default; keep Qucs' convention: rotate count = constructor rotation
-        c.rotate = s.shape.rotated & 3;
-    }
-    if typ.starts_with('.') {
-        c.tx = 0;
-        let label = wrap_label(lib.symbols.get(typ).and_then(|s| s.description.clone()).as_deref().unwrap_or(typ));
-        let (_, h) = text_size(&label, SIM_FONT);
-        c.ty = (h + 18.0).round() as i32;
-    }
-    Ok(c)
+    let shape = &lib.symbols[typ].shape;
+    Ok(Component {
+        typ: typ.into(),
+        name: name.into(),
+        active: 1,
+        x,
+        y,
+        tx: shape.tx.round() as i32,
+        ty: shape.ty.round() as i32,
+        mirror: 0,
+        rotate: shape.rotated & 3,
+        props: info
+            .props
+            .iter()
+            .map(|p| crate::schematic::Prop { value: p.default.clone(), display: if p.display { "1" } else { "0" }.into() })
+            .collect(),
+    })
 }
 
-/// Prefix for automatic names (R, C, V, OP ...).
+/// Prefix for automatic component names.
 pub fn name_prefix(typ: &str) -> String {
-    let lib = lib();
-    if let Some(i) = lib.info(typ) {
-        if !i.template.is_empty() {
-            if let Some(n) = i.template.split_whitespace().nth(1) {
-                if n != "*" {
-                    return n.trim_end_matches(char::is_numeric).to_string();
-                }
-            }
-        }
-        if !i.prefix.is_empty() {
-            return i.prefix.clone();
-        }
-    }
-    typ.trim_start_matches('.').to_string()
+    lib().info(typ).map_or_else(|| typ.to_string(), |info| info.prefix.clone())
 }

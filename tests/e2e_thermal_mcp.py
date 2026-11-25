@@ -26,10 +26,16 @@ def main():
         def call(tool_name, **args):
             return request("tools/call", {"name": tool_name, "arguments": args})
 
-        request("initialize", {"protocolVersion": "2025-06-18"})
+        initialized = request("initialize", {"protocolVersion": "2025-06-18"})
         listing = request("tools/list", {})
         created = call("new_thermal_schematic", path="rc")
-        catalog = call("list_component_types", category="thermal")
+        catalog = call("list_component_types")
+        rejected_legacy_path = call("open_schematic", path="legacy.sch")
+        rejected_legacy_header = call("open_schematic", path="legacy.qucst")
+        rejected_electrical_part = call("open_schematic", path="mixed.qucst")
+        unavailable = [
+            call(name) for name in ("run_simulation", "get_netlist", "dc_operating_point", "search_library")
+        ]
         call("add_components", components=[
             {"type": "ThResistance", "name": "R1", "x": 0, "y": 0, "props": {"R [K/W]": 2}},
             {"type": "ThCapacity", "name": "C1", "x": -30, "y": 30, "props": {"C [J/K]": 10}},
@@ -73,14 +79,26 @@ def main():
         point = call("get_thermal_results", position_mm=[50, 6])
         sweep = call("run_thermal_sweep", parameter="outer_convection", **{"from": 10, "to": 20}, count=2, position_mm=[50, 6])
 
+        legacy_schematic = "<Qucs Schematic 26.1.1>\n"
+        for name in ("legacy.sch", "legacy.qucst"):
+            (Path(temp) / name).write_text(legacy_schematic, encoding="utf-8")
+        (Path(temp) / "mixed.qucst").write_text(
+            "<Qucs-T Schematic 1>\n<Components>\n<R R1 1 0 0 0 0 0 0>\n</Components>\n",
+            encoding="utf-8",
+        )
         env = dict(os.environ, QUCS_MCP_WORKDIR=temp)
         payload = "".join(json.dumps(msg, ensure_ascii=False) + "\n" for msg in requests)
         process = subprocess.run([exe, "mcp"], cwd=root, env=env, input=payload,
                                  encoding="utf-8", capture_output=True, timeout=30, check=True)
-        responses = {item["id"]: item["result"] for item in map(json.loads, process.stdout.splitlines())}
-        assert set(responses) == set(range(1, len(requests) + 1))
-        expected_errors = {repeated, rejected, stale}
+        messages = {item["id"]: item for item in map(json.loads, process.stdout.splitlines())}
+        assert set(messages) == set(range(1, len(requests) + 1))
+        for request_id in unavailable:
+            assert messages[request_id]["error"]["code"] == -32602
+        responses = {key: message["result"] for key, message in messages.items() if key not in unavailable}
+        expected_errors = {repeated, rejected, stale, rejected_legacy_path, rejected_legacy_header, rejected_electrical_part}
         for msg in requests:
+            if msg["id"] in unavailable:
+                continue
             response = responses[msg["id"]]
             if msg["method"] == "tools/call":
                 assert response["isError"] == (msg["id"] in expected_errors), (msg, response)
@@ -88,9 +106,13 @@ def main():
         def output(call_id):
             return json.loads(responses[call_id]["content"][0]["text"])
 
-        assert any(tool["name"] == "run_thermal_analysis" for tool in responses[listing]["tools"])
+        assert responses[initialized]["serverInfo"]["name"] == "qucs-t"
+        tool_names = {tool["name"] for tool in responses[listing]["tools"]}
+        assert "run_thermal_analysis" in tool_names
+        assert not {"run_simulation", "get_netlist", "dc_operating_point", "search_library"} & tool_names
         assert output(created)["format"] == "qucst"
         assert output(catalog)["count"] == 9
+        assert {part["category"] for part in output(catalog)["types"]} == {"thermal"}
         assert output(settings)["end_s"] == 20
         assert abs(output(steady)["samples"][0]["value"] - 35) < 1e-8
         samples = output(transient)["samples"]

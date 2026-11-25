@@ -1,5 +1,5 @@
 //! Desktop editor (egui). It draws the very same scene the MCP snapshots use and
-//! follows the .sch file live, so the user can watch – and correct – the agent.
+//! follows the .qucst file live, so the user can watch – and correct – the agent.
 
 use crate::check::{self, Issue};
 use crate::doc::{same_path, snap, Doc, ExternalChange};
@@ -7,19 +7,15 @@ use crate::library::{self, lib};
 use crate::netlist::Connectivity;
 use crate::render::{build_scene, Color, Overlay, Scene, Shape};
 use crate::schematic::Schematic;
-use crate::sim;
 use crate::theme::{self, Palette};
 use egui::{Align2, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
-#[path = "gui_sim.rs"]
-mod simulation;
 #[path = "gui_thermal.rs"]
 mod thermal_ui;
 use thermal_ui::{Comparison, CylinderDialog, ThermalView};
-use simulation::{SimulationJob, SimulationView};
 
 #[cfg(windows)]
 extern "system" {
@@ -38,21 +34,13 @@ fn detach_own_console() {
     }
 }
 
-pub fn run(path: Option<PathBuf>) {
-    run_editor(path, false);
-}
-
 pub fn run_thermal(path: Option<PathBuf>) {
-    run_editor(path, true);
-}
-
-fn run_editor(path: Option<PathBuf>, thermal_mode: bool) {
     // one editor window: hand the file to a running editor (opens as a tab)
     if let Some(p) = &path {
-        let alive = crate::mcp::gui_running(thermal_mode);
+        let alive = crate::mcp::gui_running();
         if alive && std::env::var_os("QUCS_RS_NEW_WINDOW").is_none() {
             use std::io::Write as _;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(crate::mcp::gui_open_request_path(thermal_mode)) {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(crate::mcp::gui_open_request_path()) {
                 let abs = plain_path(&p.canonicalize().unwrap_or_else(|_| p.clone()));
                 if writeln!(f, "{}", abs.display()).is_ok() {
                     return;
@@ -63,10 +51,10 @@ fn run_editor(path: Option<PathBuf>, thermal_mode: bool) {
     detach_own_console();
     // the window geometry is not remembered: a saved position can point at a
     // monitor that is gone (multi-display setups), leaving the window off screen
-    let title = if thermal_mode { "Qucs-T" } else { "Qucs-S RS" };
+    let title = "Qucs-T";
     let vp = egui::ViewportBuilder::default().with_title(title).with_icon(std::sync::Arc::new(app_icon())).with_inner_size([1280.0, 780.0]).with_maximized(true);
     let opts = eframe::NativeOptions { viewport: vp, ..Default::default() };
-    let _ = eframe::run_native(title, opts, Box::new(move |cc| Ok(Box::new(App::new(cc, path, thermal_mode)))));
+    let _ = eframe::run_native(title, opts, Box::new(move |cc| Ok(Box::new(App::new(cc, path)))));
 }
 
 #[derive(Clone, PartialEq)]
@@ -77,13 +65,6 @@ enum Tool {
     Label,
     Place(String),
     Paint(String),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PaletteTab {
-    Favorites,
-    Parts,
-    Library,
 }
 
 /// What a primary-button drag in the select tool is moving.
@@ -105,7 +86,6 @@ struct Drag {
 }
 
 struct App {
-    thermal_mode: bool,
     thermal: ThermalView,
     thermal_comparison: Option<Comparison>,
     cylinder_dialog: CylinderDialog,
@@ -129,9 +109,6 @@ struct App {
     wire_pts: Vec<(i32, i32)>,
     autowire_first: Option<String>,
     place_rot: i32,
-    query: String,
-    lib_query: String,
-    palette_tab: PaletteTab,
     color_nets: bool,
     pin_names: bool,
     show_issues: bool,
@@ -146,11 +123,9 @@ struct App {
     show_issue_panel: bool,
     issue_focus: Option<(f64, f64)>,
     center_on_issue: bool,
-    sim_job: Option<SimulationJob>,
-    simulation: SimulationView,
-    simulation_panel_visible: bool,
+    thermal_panel_visible: bool,
     theme_pref: egui::ThemePreference,
-    /// Theme the scene and plot textures were built for.
+    /// Theme the schematic scene was built for.
     tex_theme: egui::Theme,
     prop_for: Option<usize>,
     property_editing: bool,
@@ -161,14 +136,12 @@ struct App {
     last_state: String,
     last_state_write: Instant,
     icons: std::collections::HashMap<String, (Vec<Shape>, [f64; 4])>,
-    tools: Tools,
     // ---- tabs: the active document lives in the fields above, the others here
     tab_id: u64,
     next_tab_id: u64,
     tabs: Vec<Option<TabState>>,
     active: usize,
     last_heartbeat: Instant,
-    mc: McWindow,
     // ---- preferences, dialogs
     settings: crate::settings::Settings,
     confirm: Option<Confirm>,
@@ -178,16 +151,12 @@ struct App {
     find_focus: bool,
     about_open: bool,
     canvas_rect: Rect,
-    op_rx: Option<(u64, Receiver<Result<sim::OperatingPoint, String>>)>,
-    op: Option<OpView>,
-    op_window: bool,
-    subckt_prompt: Option<String>,
     shot: Option<Shot>,
 }
 
 /// Self-test hook: `QUCS_RS_SHOT=out.png` saves a screenshot of the window and exits.
 /// `QUCS_RS_SHOT_ACTIONS` (comma separated) prepares the view first:
-/// `op` (DC operating point), `find:<text>`, `about`, `quit` (the save-changes dialog),
+/// `thermal-steady`, `thermal-transient`, `find:<text>`, `about`, `quit`,
 /// `select:<name>`, `zoom:<factor>`.
 struct Shot {
     path: PathBuf,
@@ -205,15 +174,6 @@ enum Confirm {
     Quit,
 }
 
-/// A computed DC operating point and the schematic it belongs to.
-struct OpView {
-    tab_id: u64,
-    comps: Vec<crate::schematic::Component>,
-    wires: Vec<crate::schematic::Wire>,
-    op: sim::OperatingPoint,
-}
-
-/// Per-document state of an inactive tab.
 struct TabState {
     tab_id: u64,
     doc: Doc,
@@ -228,7 +188,6 @@ struct TabState {
     sel_paint: Vec<usize>,
     external_change: bool,
     issues: Vec<Issue>,
-    simulation: SimulationView,
     thermal: ThermalView,
 }
 
@@ -249,189 +208,7 @@ impl TabState {
             sel_paint: vec![],
             external_change: false,
             issues: vec![],
-            simulation: SimulationView::default(),
             thermal: ThermalView::default(),
-        }
-    }
-}
-
-/// Monte Carlo window.
-struct McWindow {
-    open: bool,
-    runs: usize,
-    tol_r: f64,
-    tol_c: f64,
-    tol_l: f64,
-    gauss: bool,
-    analysis: String,
-    vector: String,
-    at: String,
-    rx: Option<Receiver<Result<(serde_json::Value, Option<(u32, u32, Vec<u8>)>, Option<(u32, u32, Vec<u8>)>), String>>>,
-    summary: Option<serde_json::Value>,
-    tex: Vec<egui::TextureHandle>,
-    raw: Vec<(u32, u32, Vec<u8>)>,
-    error: String,
-}
-
-impl Default for McWindow {
-    fn default() -> Self {
-        McWindow { open: false, runs: 50, tol_r: 5.0, tol_c: 10.0, tol_l: 10.0, gauss: true, analysis: String::new(), vector: String::new(), at: String::new(), rx: None, summary: None, tex: vec![], raw: vec![], error: String::new() }
-    }
-}
-
-/// State of the analysis / design tool windows.
-struct Tools {
-    filter_open: bool,
-    f_response: usize,
-    f_class: usize,
-    f_order: usize,
-    f_ripple: f64,
-    f_f1: String,
-    f_f2: String,
-    f_z0: f64,
-    f_series: bool,
-    f_bench: bool,
-    atten_open: bool,
-    a_topo: usize,
-    a_db: f64,
-    a_zin: f64,
-    a_zout: f64,
-    tline_open: bool,
-    t_coax: bool,
-    t_er: f64,
-    t_h: f64,
-    t_t: f64,
-    t_w: f64,
-    t_z0: f64,
-    t_freq: String,
-    t_d: f64,
-    t_dd: f64,
-    t_out: String,
-    sweep_open: bool,
-    s_param: String,
-    s_sim: String,
-    s_start: String,
-    s_stop: String,
-    s_points: String,
-    s_type: usize,
-    tune_open: bool,
-    tunes: Vec<Tune>,
-    tune_auto: bool,
-    tune_pick: usize,
-    result: String,
-}
-
-struct Tune {
-    comp: String,
-    prop: usize,
-    /// `Some(name)` for a `name=value` parameter (SpicePar / Eqn).
-    key: Option<String>,
-    label: String,
-    unit: String,
-    value: f64,
-    min: f64,
-    max: f64,
-}
-
-impl Tune {
-    fn same_target(&self, o: &Tune) -> bool {
-        self.comp == o.comp && self.prop == o.prop && self.key == o.key
-    }
-
-    /// The current value as it is written (without the `name=` part).
-    fn value_text(&self) -> String {
-        if self.key.is_none() {
-            return crate::rftools::format_value(self.value, &self.unit);
-        }
-        // SPICE reads "M" as milli and does not allow "1 k"
-        let v = crate::rftools::format_value(self.value, "").replace(' ', "");
-        match v.strip_suffix('M') {
-            Some(m) => format!("{m}Meg"),
-            None => v,
-        }
-    }
-
-    /// Property text for the current value.
-    fn text(&self) -> String {
-        match &self.key {
-            Some(k) => format!("{k}={}", self.value_text()),
-            None => self.value_text(),
-        }
-    }
-}
-
-/// Unit name following the number and SI prefix (`"10 pF"` -> `"F"`).
-fn value_unit(s: &str) -> String {
-    let rest = s.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+' || ch == 'e' || ch == 'E').trim();
-    let rest = ["Meg", "meg", "MEG"].iter().find_map(|p| rest.strip_prefix(p)).unwrap_or_else(|| rest.trim_start_matches(['f', 'p', 'n', 'u', 'µ', 'm', 'k', 'M', 'G', 'T']));
-    rest.trim().to_string()
-}
-
-/// Every numeric value of `c` that the tuning window can drive.
-fn tune_targets(c: &crate::schematic::Component) -> Vec<Tune> {
-    let keyed = c.typ == "SpicePar" || c.typ == "Eqn";
-    let mut out = Vec::new();
-    for (i, p) in c.props.iter().enumerate() {
-        let (key, text) = match p.value.split_once('=') {
-            Some((k, v)) if keyed && !k.trim().is_empty() => (Some(k.trim().to_string()), v.trim()),
-            _ => (None, p.value.trim()),
-        };
-        let Some(v) = crate::rftools::parse_value(text) else { continue };
-        if v == 0.0 || !v.is_finite() {
-            continue; // no sensible ×1/10..×10 range
-        }
-        let label = match &key {
-            Some(k) => format!("{}: {k}", c.name),
-            None => format!("{}.{}", c.name, crate::library::prop_name(c, i)),
-        };
-        let unit = if key.is_some() { String::new() } else { value_unit(text) };
-        let (min, max) = if v > 0.0 { (v / 10.0, v * 10.0) } else { (v * 10.0, v / 10.0) };
-        out.push(Tune { comp: c.name.clone(), prop: i, key, label, unit, value: v, min, max });
-    }
-    out
-}
-
-impl Default for Tools {
-    fn default() -> Self {
-        Tools {
-            filter_open: false,
-            f_response: 0,
-            f_class: 0,
-            f_order: 3,
-            f_ripple: 0.5,
-            f_f1: "10 MHz".into(),
-            f_f2: "20 MHz".into(),
-            f_z0: 50.0,
-            f_series: false,
-            f_bench: true,
-            atten_open: false,
-            a_topo: 0,
-            a_db: 10.0,
-            a_zin: 50.0,
-            a_zout: 50.0,
-            tline_open: false,
-            t_coax: false,
-            t_er: 4.4,
-            t_h: 1.6,
-            t_t: 35.0,
-            t_w: 3.0,
-            t_z0: 50.0,
-            t_freq: "1 GHz".into(),
-            t_d: 0.9,
-            t_dd: 2.95,
-            t_out: String::new(),
-            sweep_open: false,
-            s_param: String::new(),
-            s_sim: String::new(),
-            s_start: String::new(),
-            s_stop: String::new(),
-            s_points: "5".into(),
-            s_type: 0,
-            tune_open: false,
-            tunes: vec![],
-            tune_auto: true,
-            tune_pick: 0,
-            result: String::new(),
         }
     }
 }
@@ -486,19 +263,12 @@ fn app_icon() -> egui::IconData {
     egui::IconData { rgba: crate::icon_pixels::icon_rgba(64), width: 64, height: 64 }
 }
 
-/// `canonicalize` on Windows yields `\?\C:\...`; Qucs-S and users expect plain paths.
+/// `canonicalize` on Windows yields `\?\C:\...`; Use plain paths for display and file handoff.
 fn plain_path(p: &std::path::Path) -> PathBuf {
     let s = p.display().to_string();
     PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
 }
 
-/// Component for a palette key: a type name, or "Lib:<library>/<component>".
-fn spec_component(spec: &str, x: i32, y: i32) -> Result<crate::schematic::Component, String> {
-    match spec.strip_prefix("Lib:").and_then(|r| r.split_once('/')) {
-        Some((l, c)) => crate::qlib::new_lib_component(l, c, "X", x, y),
-        None => library::new_component(spec, "?", x, y),
-    }
-}
 
 fn paint_shapes_xf(painter: &egui::Painter, shapes: &[Shape], alpha: f32, z: f32, xf: &dyn Fn(f64, f64) -> Pos2) {
     let pal: &Palette = theme::pal(painter.ctx());
@@ -568,7 +338,7 @@ fn paint_shapes_xf(painter: &egui::Painter, shapes: &[Shape], alpha: f32, z: f32
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>, thermal_mode: bool) -> App {
+    fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> App {
         if std::env::var_os("QUCS_RS_NO_FONTS").is_none() {
             load_fonts(&cc.egui_ctx);
         }
@@ -578,24 +348,13 @@ impl App {
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let settings = crate::settings::Settings::load();
         let mut status = String::new();
-        let doc = if thermal_mode {
-            match path.as_deref().map(crate::thermal::open_doc) {
-                Some(Ok(doc)) => doc,
-                result => {
-                    if let Some(Err(error)) = result {
-                        status = error;
-                    }
-                    Doc::new(crate::thermal::empty(), None)
+        let doc = match path.as_deref().map(Doc::open) {
+            Some(Ok(doc)) => doc,
+            result => {
+                if let Some(Err(error)) = result {
+                    status = error;
                 }
-            }
-        } else {
-            match &path {
-                Some(p) if p.exists() => Doc::open(p).unwrap_or_else(|e| {
-                    status = format!("読み込みエラー: {e}");
-                    Doc::new(Schematic::new_empty("untitled"), Some(p.clone()))
-                }),
-                Some(p) => Doc::for_new_file(Schematic::new_empty(&p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()), p.clone()),
-                None => Doc::new(Schematic::new_empty("untitled"), None),
+                Doc::new(crate::thermal::empty(), None)
             }
         };
         let conn = doc.conn();
@@ -606,7 +365,6 @@ impl App {
         }
         let issues = if settings.show_issues { check::check(&doc.sch, &conn).issues } else { vec![] };
         App {
-            thermal_mode,
             thermal: ThermalView::default(),
             thermal_comparison: None,
             cylinder_dialog: CylinderDialog::default(),
@@ -630,9 +388,6 @@ impl App {
             wire_pts: vec![],
             autowire_first: None,
             place_rot: 0,
-            query: String::new(),
-            lib_query: String::new(),
-            palette_tab: PaletteTab::Favorites,
             color_nets: settings.color_nets,
             pin_names: settings.pin_names,
             show_issues: settings.show_issues,
@@ -647,9 +402,7 @@ impl App {
             show_issue_panel: false,
             issue_focus: None,
             center_on_issue: false,
-            sim_job: None,
-            simulation: SimulationView::default(),
-            simulation_panel_visible: false,
+            thermal_panel_visible: false,
             theme_pref,
             tex_theme: cc.egui_ctx.theme(),
             prop_for: None,
@@ -661,13 +414,11 @@ impl App {
             last_state: String::new(),
             last_state_write: Instant::now(),
             icons: Default::default(),
-            tools: Tools::default(),
             tab_id: 1,
             next_tab_id: 2,
             tabs: vec![None],
             active: 0,
             last_heartbeat: Instant::now() - std::time::Duration::from_secs(10),
-            mc: McWindow::default(),
             settings,
             confirm: None,
             allow_close: false,
@@ -676,10 +427,6 @@ impl App {
             find_focus: false,
             about_open: false,
             canvas_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)),
-            op_rx: None,
-            op: None,
-            op_window: false,
-            subckt_prompt: None,
             shot: std::env::var_os("QUCS_RS_SHOT").map(|p| Shot {
                 path: PathBuf::from(p),
                 actions: std::env::var("QUCS_RS_SHOT_ACTIONS").unwrap_or_default().split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect(),
@@ -699,7 +446,6 @@ impl App {
             for a in actions {
                 let (k, v) = a.split_once(':').unwrap_or((a.as_str(), ""));
                 match k {
-                    "op" => self.run_op(),
                     "thermal-steady" => self.thermal_run(true, ctx),
                     "thermal-transient" => self.thermal_run(false, ctx),
                     "find" => {
@@ -719,7 +465,7 @@ impl App {
             }
         }
         // screenshot once background work is done
-        let busy = self.op_rx.is_some() || self.sim_job.is_some() || self.simulation.queued || self.thermal.busy();
+        let busy = self.thermal.busy();
         if let Some(sh) = self.shot.as_mut() {
             if frame > 30 && !busy && !sh.requested {
                 sh.requested = true;
@@ -1005,7 +751,7 @@ impl App {
         let br = self.to_sch(canvas, canvas.max);
         let st = serde_json::json!({
             "file": self.doc.path.as_ref().map(|p| p.display().to_string()),
-            "format": if self.thermal_mode { "qucst" } else { "sch" },
+            "format": "qucst",
             "selected_components": self.sel.iter().filter_map(|&i| self.doc.sch.components.get(i).map(|c| c.name.clone())).collect::<Vec<_>>(),
             "selected_wires": self.sel_wires.iter().filter_map(|&i| self.doc.sch.wires.get(i).map(|w| serde_json::json!({"i": i, "p": [w.x1, w.y1, w.x2, w.y2]}))).collect::<Vec<_>>(),
             "visible_region": [tl.0, tl.1, br.0, br.1],
@@ -1016,7 +762,7 @@ impl App {
         })
         .to_string();
         if st != self.last_state {
-            let p = crate::mcp::gui_state_path(self.thermal_mode);
+            let p = crate::mcp::gui_state_path();
             if let Some(d) = p.parent() {
                 let _ = std::fs::create_dir_all(d);
             }
@@ -1168,7 +914,7 @@ impl App {
             self.status = "クリップボードに回路図データがありません".into();
             return;
         };
-        if self.thermal_mode && clip.components.iter().any(|c| !crate::thermal::is_element(&c.typ)) {
+        if clip.components.iter().any(|c| !crate::thermal::is_element(&c.typ)) {
             self.status = "熱回路素子だけ貼り付けられます".into();
             return;
         }
@@ -1287,25 +1033,12 @@ impl App {
 
     /// Input for operating point and Monte Carlo. Keep edits off disk except for the
     /// calculation's temporary copy, which lives beside the original for relative references.
-    fn sim_source(&mut self, kind: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
-        if self.finish_buffered_property_edit() {
-            self.auto_save_current();
-        }
-        let p = self.doc.path.clone().ok_or_else(|| "先に保存してください".to_string())?;
-        if !self.doc.dirty {
-            return Ok((p, None));
-        }
-        let tmp = sim::unsaved_copy_path(&p, kind)?;
-        self.doc.sch.save(&tmp)?;
-        Ok((tmp.clone(), Some(tmp)))
-    }
-
     fn blank_schematic(&self) -> Schematic {
-        if self.thermal_mode { crate::thermal::empty() } else { Schematic::new_empty("untitled") }
+        crate::thermal::empty()
     }
 
     fn file_type(&self) -> (&'static str, &'static str) {
-        if self.thermal_mode { ("Qucs-T 熱回路", "qucst") } else { ("Qucs schematic", "sch") }
+        ("Qucs-T 熱回路", "qucst")
     }
 
     fn open_dialog(&mut self) {
@@ -1328,7 +1061,7 @@ impl App {
             self.switch_tab(i);
             return;
         }
-        let result = if self.thermal_mode { crate::thermal::open_doc(p) } else { Doc::open(p) };
+        let result = Doc::open(p);
         match result {
             Ok(d) => {
                 // reuse an empty, untitled tab
@@ -1355,116 +1088,6 @@ impl App {
 
     // ------------------------------------------------------------------ DC operating point
 
-    fn run_op(&mut self) {
-        let (p, tmp) = match self.sim_source("op") {
-            Ok(x) => x,
-            Err(e) => {
-                self.status = e;
-                return;
-            }
-        };
-        let (tx, rx) = channel();
-        std::thread::spawn(move || {
-            let r = sim::operating_point(&p, 120);
-            if let Some(t) = tmp {
-                let _ = std::fs::remove_file(t);
-            }
-            let _ = tx.send(r);
-        });
-        self.op_rx = Some((self.tab_id, rx));
-        self.status = "DC 動作点を計算中…".into();
-    }
-
-    /// The operating point is shown while the schematic is unchanged since it was computed.
-    fn op_visible(&self) -> bool {
-        self.op.as_ref().map(|o| o.tab_id == self.tab_id && o.comps == self.doc.sch.components && o.wires == self.doc.sch.wires).unwrap_or(false)
-    }
-
-    fn poll_op(&mut self) {
-        let Some((tid, rx)) = &self.op_rx else { return };
-        let Ok(r) = rx.try_recv() else { return };
-        let tid = *tid;
-        self.op_rx = None;
-        match r {
-            Ok(op) if tid == self.tab_id => {
-                let n = op.net_volts.iter().filter(|v| v.is_some()).count();
-                self.status = if op.errors.is_empty() { format!("DC 動作点: {n} ネット") } else { format!("DC 動作点（警告あり）: {}", op.errors.join(" / ")) };
-                self.op = Some(OpView { tab_id: tid, comps: self.doc.sch.components.clone(), wires: self.doc.sch.wires.clone(), op });
-                self.op_window = true;
-            }
-            Ok(_) => {}
-            Err(e) => self.status = format!("DC 動作点の計算に失敗: {e}"),
-        }
-    }
-
-    /// Voltage tags on the canvas, one per net at its longest wire (or first pin).
-    fn paint_op(&self, painter: &egui::Painter, canvas: Rect) {
-        let Some(o) = self.op.as_ref().filter(|_| self.op_visible()) else { return };
-        let pal = self.pal();
-        for (ni, net) in self.conn.nets.iter().enumerate() {
-            if net.name.eq_ignore_ascii_case("gnd") {
-                continue;
-            }
-            let Some(v) = o.op.net_volts.get(ni).copied().flatten() else { continue };
-            let at = net
-                .wires
-                .iter()
-                .filter_map(|&wi| self.doc.sch.wires.get(wi))
-                .max_by_key(|w| w.len())
-                .map(|w| ((w.x1 + w.x2) as f64 / 2.0, (w.y1 + w.y2) as f64 / 2.0))
-                .or_else(|| net.pins.first().map(|&p| (self.conn.pins[p].x as f64, self.conn.pins[p].y as f64)));
-            let Some((x, y)) = at else { continue };
-            let pos = self.to_screen(canvas, x, y) + Vec2::new(4.0, 3.0);
-            let galley = painter.layout_no_wrap(format!("{}V", crate::plot::eng(v)), FontId::proportional(12.0), pal.on_accent);
-            let r = Rect::from_min_size(pos, galley.size() + Vec2::new(8.0, 2.0));
-            painter.rect_filled(r, 4.0, pal.accent.gamma_multiply(0.92));
-            painter.galley(pos + Vec2::new(4.0, 1.0), galley, pal.on_accent);
-        }
-    }
-
-    fn op_window(&mut self, ctx: &egui::Context) {
-        if !self.op_window || !self.op_visible() {
-            return;
-        }
-        let Some(o) = &self.op else { return };
-        let mut open = true;
-        egui::Window::new("DC 動作点").open(&mut open).default_size([360.0, 420.0]).min_width(320.0).show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("opv").striped(true).num_columns(2).show(ui, |ui| {
-                    ui.strong("ネット");
-                    ui.strong("電圧");
-                    ui.end_row();
-                    let mut rows: Vec<(&String, f64)> = o.op.net_names.iter().zip(&o.op.net_volts).filter(|(n, _)| !n.eq_ignore_ascii_case("gnd")).filter_map(|(n, v)| v.map(|v| (n, v))).collect();
-                    rows.sort_by(|a, b| a.0.starts_with("_net").cmp(&b.0.starts_with("_net")).then(a.0.cmp(b.0)));
-                    for (n, v) in rows {
-                        ui.label(n);
-                        ui.monospace(format!("{}V", crate::plot::eng(v)));
-                        ui.end_row();
-                    }
-                    if !o.op.currents.is_empty() {
-                        ui.end_row();
-                        ui.strong("素子");
-                        ui.strong("電流");
-                        ui.end_row();
-                        for (n, v) in &o.op.currents {
-                            ui.label(n);
-                            ui.monospace(format!("{}A", crate::plot::eng(*v)));
-                            ui.end_row();
-                        }
-                    }
-                });
-                for e in &o.op.errors {
-                    ui.colored_label(ui.visuals().warn_fg_color, e);
-                }
-            });
-        });
-        if !open {
-            self.op_window = false;
-        }
-    }
-
-    // ------------------------------------------------------------------ PDF / print
-
     fn export_pdf(&mut self) {
         let name = self.doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| format!("{}.pdf", s.to_string_lossy())).unwrap_or_else(|| "schematic.pdf".into());
         let Some(p) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(name).save_file() else { return };
@@ -1478,7 +1101,7 @@ impl App {
     /// Print = PDF in the temp folder, opened in the system viewer.
     fn print(&mut self) {
         let title = self.doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "untitled".into());
-        let p = std::env::temp_dir().join("qucs-s-rs").join(format!("{title}_print.pdf"));
+        let p = std::env::temp_dir().join("qucs-t").join(format!("{title}_print.pdf"));
         let r = crate::pdf::schematic_pdf(&self.doc.sch, &self.conn, &title).and_then(|b| {
             if let Some(d) = p.parent() {
                 let _ = std::fs::create_dir_all(d);
@@ -1492,40 +1115,6 @@ impl App {
     }
 
     // ------------------------------------------------------------------ hierarchy
-
-    fn open_selected_sub(&mut self) {
-        let Some(name) = self.sel.first().and_then(|&i| self.doc.sch.components.get(i)).map(|c| c.name.clone()) else { return };
-        match crate::hier::sub_file(&self.doc, &name) {
-            Ok(p) => self.open_path(&p),
-            Err(e) => self.status = e,
-        }
-    }
-
-    fn create_subcircuit(&mut self, file: &str) {
-        let names: Vec<String> = self.sel.iter().filter_map(|&i| self.doc.sch.components.get(i)).map(|c| c.name.clone()).collect();
-        if self.doc.dirty && !self.save_current() {
-            return;
-        }
-        self.doc.checkpoint();
-        match crate::hier::create_subcircuit(&mut self.doc, &names, file, false) {
-            Ok(r) => {
-                self.status = format!("サブ回路 {} を作成（ポート {} 個）", r["subcircuit_file"].as_str().unwrap_or(file), r["ports"].as_array().map(|a| a.len()).unwrap_or(0));
-                self.sel.clear();
-                self.sel_wires.clear();
-                self.changed();
-                if let Some(i) = r["component"].as_str().and_then(|n| self.doc.sch.component_index(n)) {
-                    self.sel = vec![i];
-                }
-            }
-            Err(e) => {
-                self.doc.undo();
-                self.changed();
-                self.status = format!("サブ回路を作成できません: {e}");
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------ find
 
     fn find_window(&mut self, ctx: &egui::Context) {
         if !self.find_open {
@@ -1599,67 +1188,15 @@ impl App {
             return;
         }
         let mut open = true;
-        if self.thermal_mode {
-            egui::Window::new("Qucs-T について").open(&mut open).collapsible(false).show(ctx, |ui| {
-                ui.heading(format!("Qucs-T {}", env!("CARGO_PKG_VERSION")));
-                ui.label("熱回路網シミュレーター");
-                ui.label("Qucs-S-Rust の回路図エディタをベースに開発");
-                ui.label("GPL-2.0-or-later");
-            });
-            self.about_open = open;
-            return;
-        }
-        egui::Window::new("Qucs-S RS について").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.heading(format!("Qucs-S RS {}", env!("CARGO_PKG_VERSION")));
-            ui.label("Qucs-S の Rust 製フォーク（軽量回路図エディタ＋MCP サーバー）");
-            ui.label("ライセンス: GPL-2.0-or-later");
-            ui.separator();
-            let found = |r: Result<PathBuf, String>| r.map(|p| p.display().to_string()).unwrap_or_else(|_| "見つかりません".into());
-            egui::Grid::new("about").num_columns(2).show(ui, |ui| {
-                ui.label("ngspice");
-                ui.monospace(found(sim::ngspice_path()));
-                ui.end_row();
-                ui.label("Qucs-S");
-                ui.monospace(found(sim::qucs_s_path()));
-                ui.end_row();
-                ui.label("ネットリスト");
-                ui.label(if sim::qucs_s_path().is_ok() { "内蔵（未対応の部品は Qucs-S）" } else { "内蔵のみ" });
-                ui.end_row();
-                ui.label("設定");
-                ui.monospace(crate::settings::config_dir().map(|p| p.display().to_string()).unwrap_or_default());
-                ui.end_row();
-            });
+        egui::Window::new("Qucs-T について").open(&mut open).collapsible(false).show(ctx, |ui| {
+            ui.heading(format!("Qucs-T {}", env!("CARGO_PKG_VERSION")));
+            ui.label("熱回路網シミュレーター");
+            ui.label("Qucs-S-Rust の回路図エディタをベースに開発");
+            ui.label("GPL-2.0-or-later");
         });
         self.about_open = open;
     }
 
-    fn subckt_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut name) = self.subckt_prompt.take() else { return };
-        let (mut ok, mut cancel) = (false, false);
-        egui::Window::new("サブ回路を作成").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            ui.label(format!("選択した {} 個の部品を新しいファイルへ移し、Sub 部品で置き換えます。", self.sel.len()));
-            ui.label("外へつながるネットごとにポートができます。");
-            ui.horizontal(|ui| {
-                ui.label("ファイル名");
-                let r = ui.text_edit_singleline(&mut name);
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    ok = true;
-                }
-            });
-            ui.small("（現在の回路図と同じフォルダに保存）");
-            ui.horizontal(|ui| {
-                ok |= ui.button("作成").clicked();
-                cancel = ui.button("キャンセル").clicked();
-            });
-        });
-        if ok && !name.trim().is_empty() {
-            self.create_subcircuit(name.trim());
-        } else if !cancel {
-            self.subckt_prompt = Some(name);
-        }
-    }
-
-    /// "Save changes?" for closing a tab or the window.
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
         let Some(c) = self.confirm else { return };
         enum Answer {
@@ -1734,7 +1271,7 @@ impl App {
         TabState {
             tab_id: self.tab_id,
             doc: std::mem::replace(&mut self.doc, Doc::new(Schematic::default(), None)),
-            conn: std::mem::replace(&mut self.conn, Connectivity::build(&Schematic::default(), None)),
+            conn: std::mem::replace(&mut self.conn, Connectivity::build(&Schematic::default())),
             scene: std::mem::take(&mut self.scene),
             gen: self.gen,
             offset: self.offset,
@@ -1745,7 +1282,6 @@ impl App {
             sel_paint: std::mem::take(&mut self.sel_paint),
             external_change: self.external_change,
             issues: std::mem::take(&mut self.issues),
-            simulation: std::mem::take(&mut self.simulation),
             thermal: std::mem::take(&mut self.thermal),
         }
     }
@@ -1768,7 +1304,6 @@ impl App {
         self.external_change = t.external_change;
         self.external_review = None;
         self.issues = t.issues;
-        self.simulation = t.simulation;
         self.thermal = t.thermal;
         // transient interaction state belongs to no tab
         self.drag = None;
@@ -1779,7 +1314,6 @@ impl App {
         self.paint_start = None;
         self.prop_for = None;
         self.property_editing = false;
-        self.simulation.invalidate_chart();
         self.last_poll = Instant::now() - std::time::Duration::from_secs(1);
         self.issue_focus = None;
         self.center_on_issue = false;
@@ -1894,7 +1428,7 @@ impl App {
             return;
         }
         self.last_heartbeat = Instant::now();
-        let p = crate::mcp::gui_heartbeat_path(self.thermal_mode);
+        let p = crate::mcp::gui_heartbeat_path();
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
@@ -1902,7 +1436,7 @@ impl App {
     }
 
     fn poll_open_requests(&mut self) {
-        let p = crate::mcp::gui_open_request_path(self.thermal_mode);
+        let p = crate::mcp::gui_open_request_path();
         let Ok(text) = std::fs::read_to_string(&p) else { return };
         let _ = std::fs::remove_file(&p);
         for line in text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
@@ -1912,149 +1446,6 @@ impl App {
 
     // ------------------------------------------------------------------ Monte Carlo
 
-    fn mc_textures(&mut self, ctx: &egui::Context) {
-        let pal = theme::pal(ctx);
-        self.mc.tex = self
-            .mc
-            .raw
-            .iter()
-            .enumerate()
-            .map(|(k, img)| {
-                let ci = egui::ColorImage::from_rgba_premultiplied([img.0 as usize, img.1 as usize], &pal.map_image(&img.2));
-                ctx.load_texture(format!("mc{k}"), ci, egui::TextureOptions::LINEAR)
-            })
-            .collect();
-    }
-
-    fn mc_window(&mut self, ctx: &egui::Context) {
-        if let Some(rx) = &self.mc.rx {
-            if let Ok(r) = rx.try_recv() {
-                self.mc.rx = None;
-                match r {
-                    Ok((summary, ov, hist)) => {
-                        self.mc.raw = [ov, hist].into_iter().flatten().collect();
-                        self.mc_textures(ctx);
-                        self.status = format!("モンテカルロ完了: {} 回", summary["successful"]);
-                        self.mc.summary = Some(summary);
-                        self.mc.error.clear();
-                    }
-                    Err(e) => self.mc.error = e,
-                }
-            }
-        }
-        if !self.mc.open {
-            return;
-        }
-        let mut open = true;
-        let mut start = false;
-        egui::Window::new("モンテカルロ解析").open(&mut open).default_size([900.0, 700.0]).show(ctx, |ui| {
-            let m = &mut self.mc;
-            ui.small("回路の解析（AC・過渡など）を、部品値をばらつかせて何度も実行します。1 回目は公称値です。");
-            egui::Grid::new("mcg").num_columns(4).show(ui, |ui| {
-                ui.label("回数");
-                ui.add(egui::DragValue::new(&mut m.runs).range(2..=2000));
-                ui.label("分布");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut m.gauss, true, "正規 (許容差=3σ)");
-                    ui.radio_value(&mut m.gauss, false, "一様");
-                });
-                ui.end_row();
-                ui.label("許容差 R [%]");
-                ui.add(egui::DragValue::new(&mut m.tol_r).range(0.0..=50.0).speed(0.1));
-                ui.label("C [%]");
-                ui.add(egui::DragValue::new(&mut m.tol_c).range(0.0..=50.0).speed(0.1));
-                ui.end_row();
-                ui.label("L [%]");
-                ui.add(egui::DragValue::new(&mut m.tol_l).range(0.0..=50.0).speed(0.1));
-                ui.label("解析");
-                ui.add(egui::TextEdit::singleline(&mut m.analysis).hint_text("ac1 / tr1（空=最初）").desired_width(120.0));
-                ui.end_row();
-                ui.label("ベクトル");
-                ui.add(egui::TextEdit::singleline(&mut m.vector).hint_text("v(out)").desired_width(120.0));
-                ui.label("測定点 (x)");
-                ui.add(egui::TextEdit::singleline(&mut m.at).hint_text("10 MHz, 20 MHz").desired_width(160.0));
-                ui.end_row();
-            });
-            ui.horizontal(|ui| {
-                if m.rx.is_some() {
-                    ui.spinner();
-                    ui.label("実行中…");
-                } else if ui.button("▶ 実行").clicked() {
-                    start = true;
-                }
-            });
-            if !m.error.is_empty() {
-                ui.colored_label(ui.visuals().error_fg_color, &m.error);
-            }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if let Some(s) = &m.summary {
-                    ui.label(format!("成功 {} / {} 回   分布: {}", s["successful"], s["runs"], s["distribution"].as_str().unwrap_or("")));
-                    if let Some(y) = s.get("yield").filter(|y| !y.is_null()) {
-                        ui.label(format!("歩留まり: {}%", y["yield_percent"]));
-                    }
-                    egui::Grid::new("mcstats").striped(true).show(ui, |ui| {
-                        for h in ["ベクトル", "x", "公称", "平均", "σ", "最小", "最大"] {
-                            ui.strong(h);
-                        }
-                        ui.end_row();
-                        for mm in s["measurements"].as_array().cloned().unwrap_or_default() {
-                            let st = &mm["stats"];
-                            let f = |v: &serde_json::Value| v.as_f64().map(|x| format!("{x:.4}")).unwrap_or_default();
-                            ui.label(format!("{} {}", mm["vector"].as_str().unwrap_or(""), mm["unit"].as_str().unwrap_or("")));
-                            ui.label(mm["at"].as_f64().map(crate::plot::eng).unwrap_or_else(|| "終点".into()));
-                            ui.label(f(&mm["nominal"]));
-                            ui.label(f(&st["mean"]));
-                            ui.label(f(&st["std"]));
-                            ui.label(f(&st["min"]));
-                            ui.label(f(&st["max"]));
-                            ui.end_row();
-                        }
-                    });
-                }
-                for t in &m.tex {
-                    let w = ui.available_width();
-                    let sz = t.size_vec2();
-                    ui.image((t.id(), sz * (w / sz.x).min(1.0)));
-                }
-            });
-        });
-        self.mc.open = open;
-        if start {
-            let (p, tmp) = match self.sim_source("mc") {
-                Ok(x) => x,
-                Err(e) => {
-                    self.mc.error = e;
-                    return;
-                }
-            };
-            let m = &self.mc;
-            let at: Vec<serde_json::Value> = m.at.split(',').filter_map(|x| crate::rftools::parse_value(x.trim())).map(|x| serde_json::json!(x)).collect();
-            let args = serde_json::json!({
-                "runs": m.runs, "distribution": if m.gauss { "gauss" } else { "uniform" },
-                "tolerances": {"R": m.tol_r, "C": m.tol_c, "L": m.tol_l},
-                "analysis": if m.analysis.trim().is_empty() { serde_json::Value::Null } else { serde_json::json!(m.analysis.trim()) },
-                "vectors": if m.vector.trim().is_empty() { serde_json::json!([]) } else { serde_json::json!([m.vector.trim()]) },
-                "at": at,
-            });
-            let (tx, rx) = channel();
-            std::thread::spawn(move || {
-                let spec = crate::montecarlo::spec_from_json(&args);
-                let r = crate::montecarlo::run(&p, &spec).map(|res| {
-                    let ov = crate::montecarlo::overlay_svg(&res, &spec, 200).ok().and_then(|s| crate::render::svg_to_rgba(&s).ok());
-                    let first = res.summary["measurements"].as_array().and_then(|m| m.first()).cloned();
-                    let hist = first.and_then(|m| crate::montecarlo::histogram_svg(&res, &spec, m["vector"].as_str().unwrap_or(""), m["at"].as_f64())).and_then(|s| crate::render::svg_to_rgba(&s).ok());
-                    (res.summary, ov, hist)
-                });
-                if let Some(t) = tmp {
-                    let _ = std::fs::remove_file(t);
-                }
-                let _ = tx.send(r);
-            });
-            self.mc.rx = Some(rx);
-        }
-    }
-
-    /// Ask for a file name and save there. False when cancelled or failed.
     fn save_as(&mut self) -> bool {
         let (description, extension) = self.file_type();
         let name = self.doc.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| format!("untitled.{extension}"));
@@ -2240,31 +1631,14 @@ impl App {
                 self.refresh_issues();
                 self.gen += 1;
             }
-            if self.thermal_mode {
-                if ui.button("熱解析…").on_hover_text("F5").clicked() {
-                    self.open_thermal();
-                }
-                if ui.button("サンプル").clicked() {
-                    self.open_thermal_sample();
-                }
-                if ui.button("円筒回路を生成…").clicked() {
-                    self.open_cylinder_window();
-                }
-            } else {
-                let pal = self.pal();
-                let run = egui::Button::new(egui::RichText::new("▶ シミュレーション").color(pal.on_accent)).fill(pal.accent).stroke(Stroke::NONE);
-                if ui.add(run).on_hover_text("F5").clicked() {
-                    self.run_sim();
-                }
-                let op_on = self.op_visible();
-                if ui.selectable_label(op_on, "⚡ 動作点").on_hover_text("DC 動作点を計算して、各ネットの電圧を回路図に表示").clicked() {
-                    if op_on {
-                        self.op = None;
-                        self.op_window = false;
-                    } else {
-                        self.run_op();
-                    }
-                }
+            if ui.button("熱解析…").on_hover_text("F5").clicked() {
+                self.open_thermal();
+            }
+            if ui.button("サンプル").clicked() {
+                self.open_thermal_sample();
+            }
+            if ui.button("円筒回路を生成…").clicked() {
+                self.open_cylinder_window();
             }
             ui.menu_button("✏ 図形", |ui| {
                 for (k, label) in [("line", "線"), ("rect", "矩形"), ("ellipse", "楕円"), ("arrow", "矢印"), ("text", "テキスト (T)")] {
@@ -2289,28 +1663,6 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
-                if !self.thermal_mode {
-                    let can_sub = !self.sel.is_empty() && self.doc.path.is_some();
-                    if ui
-                        .add_enabled(can_sub, egui::Button::new("サブ回路を作成…"))
-                        .on_disabled_hover_text("部品を選択し、回路図を保存してから実行します")
-                        .on_hover_text("選択した部品を新しいサブ回路ファイルへ移し、Sub 部品で置き換える")
-                        .clicked()
-                    {
-                        let used: std::collections::HashSet<String> = std::fs::read_dir(self.doc.dir().unwrap_or_default())
-                            .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect())
-                            .unwrap_or_default();
-                        let name = (1..).map(|k| format!("sub{k}.sch")).find(|n| !used.contains(n)).unwrap_or_else(|| "sub.sch".into());
-                        self.subckt_prompt = Some(name);
-                        ui.close();
-                    }
-                    let sub_sel = self.sel.len() == 1 && self.doc.sch.components.get(self.sel[0]).map(|c| c.typ == "Sub").unwrap_or(false);
-                    if ui.add_enabled(sub_sel, egui::Button::new("サブ回路を開く")).on_hover_text("Sub 部品をダブルクリックしても開けます").clicked() {
-                        self.open_selected_sub();
-                        ui.close();
-                    }
-                    ui.separator();
-                }
                 for (m, label) in [("left", "左揃え"), ("right", "右揃え"), ("top", "上揃え"), ("bottom", "下揃え"), ("vcenter", "縦中心揃え"), ("hcenter", "横中心揃え"), ("distribute_h", "横に等間隔"), ("distribute_v", "縦に等間隔")] {
                     if ui.add_enabled(self.sel.len() >= 2, egui::Button::new(label)).clicked() {
                         self.align_selected(m);
@@ -2318,9 +1670,6 @@ impl App {
                     }
                 }
             });
-            if !self.thermal_mode {
-                self.tools_menu(ui);
-            }
             ui.menu_button("🖼 書き出し", |ui| {
                 if ui.button("PNG / SVG…").clicked() {
                     self.export_image();
@@ -2360,8 +1709,8 @@ impl App {
         self.icons.entry(typ.to_string()).or_insert_with(|| {
             let mut shapes = Vec::new();
             let mut bb = [-20.0, -20.0, 20.0, 20.0];
-            if let Ok(c) = spec_component(typ, 0, 0) {
-                let p = library::place(&c, None);
+            if let Ok(c) = library::new_component(typ, "?", 0, 0) {
+                let p = library::place(&c);
                 for prim in &p.prims {
                     crate::render::prim_shapes(prim, &mut shapes, None);
                 }
@@ -2376,17 +1725,12 @@ impl App {
 
     fn palette_entry(&mut self, ui: &mut egui::Ui, typ: &str, caption: &str, sub_line: &str, description: &str) {
         const ICON: Vec2 = Vec2::new(46.0, 34.0);
-        const FAVORITE_SIZE: f32 = 26.0;
-
-        let favorite_index = self.settings.part_favorites.iter().position(|key| key == typ);
         let width = ui.available_width().min(ui.clip_rect().right() - ui.cursor().left()).max(0.0);
-        let favorite_width = FAVORITE_SIZE.min(width);
-        let part_width = if self.thermal_mode { width } else { (width - favorite_width - ui.spacing().item_spacing.x).max(0.0) };
         let text = ui.painter().layout(
             format!("{caption}\n{sub_line}"),
             FontId::proportional(12.5),
             ui.visuals().text_color(),
-            (part_width - ICON.x - 12.0).max(16.0),
+            (width - ICON.x - 12.0).max(16.0),
         );
         // One allocation keeps the scroll area within the palette, even if a label or star
         // needs more room than its assigned rectangle.
@@ -2394,19 +1738,14 @@ impl App {
         if !ui.is_rect_visible(row) {
             return;
         }
-        let part_rect = Rect::from_min_size(row.min, Vec2::new(part_width, row.height()));
-        let favorite_rect = Rect::from_center_size(
-            Pos2::new(row.right() - favorite_width / 2.0, row.center().y),
-            Vec2::new(favorite_width, FAVORITE_SIZE),
-        );
         let id = ui.make_persistent_id(typ);
         let selected = matches!(&self.tool, Tool::Place(key) if key == typ);
-        let part = ui.interact(part_rect, id, Sense::click());
+        let part = ui.interact(row, id, Sense::click());
         part.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, caption));
         let part_visuals = ui.style().interact_selectable(&part, selected);
-        let painter = ui.painter().with_clip_rect(part_rect);
+        let painter = ui.painter().with_clip_rect(row);
         if selected || part.hovered() || part.has_focus() {
-            painter.rect_filled(part_rect, 3.0, part_visuals.weak_bg_fill);
+            painter.rect_filled(row, 3.0, part_visuals.weak_bg_fill);
         }
         let icon_rect = Rect::from_center_size(Pos2::new(row.left() + 2.0 + ICON.x / 2.0, row.center().y), ICON);
         let (shapes, bounds) = self.icon(typ).clone();
@@ -2419,148 +1758,9 @@ impl App {
         let text_pos = Pos2::new(icon_rect.right() + 6.0, row.center().y - text.size().y / 2.0);
         painter.galley(text_pos, text, part_visuals.text_color());
         if part.on_hover_text(description).clicked() {
-            self.place_rot = spec_component(typ, 0, 0).map(|c| c.rotate).unwrap_or(0);
+            self.place_rot = library::new_component(typ, "?", 0, 0).map(|c| c.rotate).unwrap_or(0);
             self.tool = Tool::Place(typ.to_string());
         }
-        if self.thermal_mode {
-            return;
-        }
-
-        let (star, action) = if favorite_index.is_some() {
-            ("★", "よく使う部品から外す")
-        } else {
-            ("☆", "よく使う部品に追加")
-        };
-        let favorite = ui.interact(favorite_rect, id.with("favorite"), Sense::click());
-        favorite.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), action));
-        let star_visuals = ui.style().interact(&favorite);
-        let painter = ui.painter().with_clip_rect(favorite_rect);
-        painter.rect(favorite_rect, 3.0, star_visuals.weak_bg_fill, star_visuals.bg_stroke, egui::StrokeKind::Inside);
-        painter.text(favorite_rect.center(), Align2::CENTER_CENTER, star, FontId::proportional(14.0), star_visuals.text_color());
-        if favorite.on_hover_text(action).clicked() {
-            if let Some(index) = favorite_index {
-                self.settings.part_favorites.remove(index);
-            } else {
-                self.settings.part_favorites.push(typ.to_string());
-            }
-            self.settings.save();
-        }
-    }
-
-    fn builtin_palette_entry(&mut self, ui: &mut egui::Ui, part: &library::CompInfo) {
-        self.palette_entry(ui, &part.typ, crate::palette::caption(part), &part.typ, &part.description);
-    }
-
-    fn palette(&mut self, ui: &mut egui::Ui) {
-        if self.thermal_mode {
-            self.thermal_palette(ui);
-            return;
-        }
-        use PaletteTab::{Favorites, Library, Parts};
-
-        ui.horizontal_wrapped(|ui| {
-            for (tab, label) in [(Favorites, "よく使う"), (Parts, "部品"), (Library, "ライブラリ")] {
-                if ui.selectable_value(&mut self.palette_tab, tab, label).clicked() && tab == Favorites {
-                    self.query.clear();
-                }
-            }
-        });
-        if self.palette_tab == Library {
-            self.library_browser(ui);
-            return;
-        }
-
-        ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("部品を検索（抵抗、電源、R）"));
-        let query = crate::palette::search_text(self.query.trim());
-        let scroll_id = if !query.is_empty() { "part_search" } else if self.palette_tab == Favorites { "favorites" } else { "parts" };
-        egui::ScrollArea::vertical().id_salt(scroll_id).show(ui, |ui| {
-            if !query.is_empty() {
-                let mut matches: Vec<_> = lib().comps.iter().filter(|part| crate::palette::matches(part, &query)).collect();
-                matches.sort_by_key(|part| (!part.typ.eq_ignore_ascii_case(&query), !self.settings.part_favorites.contains(&part.typ)));
-                if matches.is_empty() {
-                    ui.label("該当する部品がありません。");
-                }
-                for part in matches {
-                    self.builtin_palette_entry(ui, part);
-                }
-            } else if self.palette_tab == Favorites {
-                let favorites = self.settings.part_favorites.clone();
-                let mut available = false;
-                for key in favorites {
-                    if let Some(part) = lib().info(&key) {
-                        available = true;
-                        self.builtin_palette_entry(ui, part);
-                    } else if let Some((lib, name)) = key.strip_prefix("Lib:").and_then(|key| key.split_once('/')) {
-                        if let Some((_, part)) = crate::qlib::find(lib, name) {
-                            available = true;
-                            self.palette_entry(ui, &key, &part.name, lib, &part.description);
-                        }
-                    }
-                }
-                if !available {
-                    ui.label("部品やライブラリの ☆ から登録できます。");
-                }
-            } else {
-                let mut groups = std::collections::BTreeMap::<&str, Vec<_>>::new();
-                for part in &lib().comps {
-                    groups.entry(&part.category).or_default().push(part);
-                }
-                let mut groups: Vec<_> = groups.into_iter().collect();
-                groups.sort_by_key(|(category, _)| match *category {
-                    "lumped components" => 0,
-                    "sources" => 1,
-                    "simulations" => 2,
-                    _ => 3,
-                });
-                for (category, parts) in groups {
-                    let name = crate::palette::category_name(category);
-                    egui::CollapsingHeader::new(format!("{name} ({})", parts.len()))
-                        .id_salt(category)
-                        .default_open(category == "lumped components")
-                        .show(ui, |ui| {
-                            for part in parts {
-                                self.builtin_palette_entry(ui, part);
-                            }
-                        });
-                }
-            }
-        });
-    }
-
-    /// Qucs-S component libraries (real parts) with symbol icons.
-    fn library_browser(&mut self, ui: &mut egui::Ui) {
-        ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("検索（LM358、ダイオード）"));
-        let libs = crate::qlib::libraries();
-        if libs.is_empty() {
-            ui.label("Qucs-S のライブラリが見つかりません（QUCS_S_LIBRARY で指定できます）");
-            return;
-        }
-        let query = crate::palette::search_text(self.lib_query.trim());
-        egui::ScrollArea::vertical().id_salt("libs").show(ui, |ui| {
-            let mut found = false;
-            for l in libs {
-                let items: Vec<&crate::qlib::LibComp> = l
-                    .comps
-                    .iter()
-                    .filter(|c| query.is_empty() || crate::palette::library_matches(&l.name, &c.name, &c.description, &query))
-                    .collect();
-                if items.is_empty() {
-                    continue;
-                }
-                found = true;
-                let title = format!("{} ({}){}", l.name, items.len(), if l.ngspice_ok { "" } else { "  ⚠ngspice非対応" });
-                egui::CollapsingHeader::new(title).id_salt((&l.name, !query.is_empty())).default_open(!query.is_empty() && items.len() <= 30).show(ui, |ui| {
-                    for c in items.iter().take(400) {
-                        let key = format!("Lib:{}/{}", l.name, c.name);
-                        let desc: String = c.description.chars().take(60).collect();
-                        self.palette_entry(ui, &key, &c.name, &desc, &c.description);
-                    }
-                });
-            }
-            if !found {
-                ui.label("該当するライブラリ部品がありません。");
-            }
-        });
     }
 
     fn properties(&mut self, ui: &mut egui::Ui) {
@@ -2611,10 +1811,6 @@ impl App {
             }
         });
         ui.label(format!("位置 ({}, {})  回転 {}  ミラー {}", c.x, c.y, c.rotate, c.mirror));
-        if c.typ == "Sub" && ui.button("⤵ サブ回路を開く").on_hover_text("ダブルクリックでも開けます").clicked() {
-            self.open_selected_sub();
-            return;
-        }
         ui.horizontal(|ui| {
             if ui.button("⟲ 回転 (R)").clicked() {
                 self.rotate_selected();
@@ -2768,369 +1964,6 @@ impl App {
 
     // ------------------------------------------------------------------ tools
 
-    fn tools_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("⚙ ツール", |ui| {
-            if ui.button("フィルタ設計…").clicked() {
-                self.tools.filter_open = true;
-                ui.close();
-            }
-            if ui.button("減衰器設計…").clicked() {
-                self.tools.atten_open = true;
-                ui.close();
-            }
-            if ui.button("伝送線路計算…").clicked() {
-                self.tools.tline_open = true;
-                ui.close();
-            }
-            ui.separator();
-            if ui.button("パラメータスイープ…").clicked() {
-                if let Some(&ci) = self.sel.first() {
-                    let c = &self.doc.sch.components[ci];
-                    self.tools.s_param = c.name.clone();
-                    if let Some(v) = c.props.first().and_then(|p| crate::rftools::parse_value(&p.value)) {
-                        self.tools.s_start = crate::plot::eng(v / 2.0);
-                        self.tools.s_stop = crate::plot::eng(v * 2.0);
-                    }
-                }
-                if self.tools.s_sim.is_empty() {
-                    self.tools.s_sim = self.doc.sch.components.iter().find(|c| c.typ.starts_with('.') && c.typ != ".SW").map(|c| c.name.clone()).unwrap_or_default();
-                }
-                self.tools.sweep_open = true;
-                ui.close();
-            }
-            if ui.button("モンテカルロ解析…").clicked() {
-                self.mc.open = true;
-                ui.close();
-            }
-            if ui.button("チューニング…").clicked() {
-                self.tools.tune_open = true;
-                ui.close();
-            }
-        });
-    }
-
-    fn place_design(&mut self, d: Result<crate::rftools::Design, String>, bench: Option<(f64, f64, f64, f64)>) {
-        let d = match d {
-            Ok(d) => d,
-            Err(e) => {
-                self.tools.result = e;
-                return;
-            }
-        };
-        let conn = self.doc.conn();
-        let maxy = conn.placed.iter().map(|p| p.bbox[3]).fold(0.0f64, f64::max);
-        let (x, y) = (300, (maxy as i32 + 120).max(120));
-        self.doc.checkpoint();
-        match crate::synth::place_design(&mut self.doc, &d, x, y, bench) {
-            Ok(_) => {
-                self.tools.result = format!("{}\n{}", d.title, d.notes.join("\n"));
-                self.need_fit = true;
-                self.changed();
-            }
-            Err(e) => self.tools.result = e,
-        }
-    }
-
-    fn tool_windows(&mut self, ctx: &egui::Context) {
-        // ---------- filter
-        let mut open = self.tools.filter_open;
-        egui::Window::new("フィルタ設計").open(&mut open).resizable(false).show(ctx, |ui| {
-            let t = &mut self.tools;
-            egui::Grid::new("filt").num_columns(2).show(ui, |ui| {
-                ui.label("特性");
-                egui::ComboBox::from_id_salt("fr").selected_text(["Butterworth", "Chebyshev", "Bessel"][t.f_response]).show_ui(ui, |ui| {
-                    for (k, n) in ["Butterworth", "Chebyshev", "Bessel"].iter().enumerate() {
-                        ui.selectable_value(&mut t.f_response, k, *n);
-                    }
-                });
-                ui.end_row();
-                ui.label("種類");
-                egui::ComboBox::from_id_salt("fc").selected_text(["ローパス", "ハイパス", "バンドパス", "バンドストップ"][t.f_class]).show_ui(ui, |ui| {
-                    for (k, n) in ["ローパス", "ハイパス", "バンドパス", "バンドストップ"].iter().enumerate() {
-                        ui.selectable_value(&mut t.f_class, k, *n);
-                    }
-                });
-                ui.end_row();
-                ui.label("次数");
-                ui.add(egui::DragValue::new(&mut t.f_order).range(1..=10));
-                ui.end_row();
-                if t.f_response == 1 {
-                    ui.label("リップル [dB]");
-                    ui.add(egui::DragValue::new(&mut t.f_ripple).range(0.01..=3.0).speed(0.01));
-                    ui.end_row();
-                }
-                ui.label(if t.f_class >= 2 { "下側周波数" } else { "カットオフ周波数" });
-                ui.text_edit_singleline(&mut t.f_f1);
-                ui.end_row();
-                if t.f_class >= 2 {
-                    ui.label("上側周波数");
-                    ui.text_edit_singleline(&mut t.f_f2);
-                    ui.end_row();
-                }
-                ui.label("インピーダンス [Ω]");
-                ui.add(egui::DragValue::new(&mut t.f_z0).range(1.0..=1e6));
-                ui.end_row();
-                ui.label("構成");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut t.f_series, false, "π (並列から)");
-                    ui.radio_value(&mut t.f_series, true, "T (直列から)");
-                });
-                ui.end_row();
-            });
-            ui.checkbox(&mut t.f_bench, "テスト回路（信号源・負荷・AC解析）も追加");
-            if ui.button("設計して配置").clicked() {
-                let args = serde_json::json!({
-                    "response": (["butterworth", "chebyshev", "bessel"][t.f_response]), "ripple_db": t.f_ripple,
-                    "class": (["lowpass", "highpass", "bandpass", "bandstop"][t.f_class]), "order": t.f_order,
-                    "f1": t.f_f1, "f2": t.f_f2, "z0": t.f_z0, "first_series": t.f_series,
-                });
-                let bench_on = t.f_bench;
-                let spec = crate::synth::filter_spec(&args);
-                match spec {
-                    Ok(spec) => {
-                        let d = crate::rftools::lc_filter(&spec);
-                        let zl = d.as_ref().ok().and_then(|d| d.values.get("z_load").and_then(|v| v.as_f64())).unwrap_or(spec.z0);
-                        let (lo, hi) = crate::synth::bench_range(&spec);
-                        self.place_design(d, bench_on.then_some((spec.z0, zl, lo, hi)));
-                    }
-                    Err(e) => self.tools.result = e,
-                }
-            }
-            if !self.tools.result.is_empty() {
-                ui.label(&self.tools.result);
-            }
-        });
-        self.tools.filter_open = open;
-
-        // ---------- attenuator
-        let mut open = self.tools.atten_open;
-        egui::Window::new("減衰器設計").open(&mut open).resizable(false).show(ctx, |ui| {
-            let t = &mut self.tools;
-            egui::Grid::new("att").num_columns(2).show(ui, |ui| {
-                ui.label("構成");
-                egui::ComboBox::from_id_salt("at").selected_text(["π型", "T型", "ブリッジT型"][t.a_topo]).show_ui(ui, |ui| {
-                    for (k, n) in ["π型", "T型", "ブリッジT型"].iter().enumerate() {
-                        ui.selectable_value(&mut t.a_topo, k, *n);
-                    }
-                });
-                ui.end_row();
-                ui.label("減衰量 [dB]");
-                ui.add(egui::DragValue::new(&mut t.a_db).range(0.1..=100.0).speed(0.1));
-                ui.end_row();
-                ui.label("入力 Z [Ω]");
-                ui.add(egui::DragValue::new(&mut t.a_zin).range(1.0..=1e6));
-                ui.end_row();
-                ui.label("出力 Z [Ω]");
-                ui.add(egui::DragValue::new(&mut t.a_zout).range(1.0..=1e6));
-                ui.end_row();
-            });
-            if ui.button("設計して配置").clicked() {
-                let topo = [crate::rftools::AttenuatorTopology::Pi, crate::rftools::AttenuatorTopology::Tee, crate::rftools::AttenuatorTopology::BridgedTee][t.a_topo];
-                let (db, zi, zo) = (t.a_db, t.a_zin, t.a_zout);
-                let d = crate::rftools::attenuator(topo, db, zi, zo);
-                self.place_design(d, None);
-            }
-            if !self.tools.result.is_empty() {
-                ui.label(&self.tools.result);
-            }
-        });
-        self.tools.atten_open = open;
-
-        // ---------- transmission line
-        let mut open = self.tools.tline_open;
-        egui::Window::new("伝送線路計算").open(&mut open).resizable(false).show(ctx, |ui| {
-            let t = &mut self.tools;
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut t.t_coax, false, "マイクロストリップ");
-                ui.radio_value(&mut t.t_coax, true, "同軸");
-            });
-            egui::Grid::new("tl").num_columns(2).show(ui, |ui| {
-                ui.label("εr");
-                ui.add(egui::DragValue::new(&mut t.t_er).range(1.0..=100.0).speed(0.01));
-                ui.end_row();
-                if t.t_coax {
-                    ui.label("内導体径 d [mm]");
-                    ui.add(egui::DragValue::new(&mut t.t_d).speed(0.01));
-                    ui.end_row();
-                    ui.label("外導体内径 D [mm]");
-                    ui.add(egui::DragValue::new(&mut t.t_dd).speed(0.01));
-                    ui.end_row();
-                } else {
-                    ui.label("基板厚 h [mm]");
-                    ui.add(egui::DragValue::new(&mut t.t_h).speed(0.01));
-                    ui.end_row();
-                    ui.label("銅箔厚 t [µm]");
-                    ui.add(egui::DragValue::new(&mut t.t_t).speed(1.0));
-                    ui.end_row();
-                    ui.label("線幅 w [mm]");
-                    ui.add(egui::DragValue::new(&mut t.t_w).speed(0.01));
-                    ui.end_row();
-                    ui.label("目標 Z0 [Ω]");
-                    ui.add(egui::DragValue::new(&mut t.t_z0).speed(0.1));
-                    ui.end_row();
-                }
-                ui.label("周波数");
-                ui.text_edit_singleline(&mut t.t_freq);
-                ui.end_row();
-            });
-            ui.horizontal(|ui| {
-                if !t.t_coax {
-                    if ui.button("解析 (w → Z0)").clicked() {
-                        let a = serde_json::json!({"kind": "microstrip", "er": t.t_er, "h_mm": t.t_h, "t_um": t.t_t, "w_mm": t.t_w, "freq": t.t_freq});
-                        t.t_out = crate::synth::tline(&a).map(|v| serde_json::to_string_pretty(&v).unwrap()).unwrap_or_else(|e| e);
-                    }
-                    if ui.button("合成 (Z0 → w)").clicked() {
-                        let a = serde_json::json!({"kind": "microstrip", "er": t.t_er, "h_mm": t.t_h, "t_um": t.t_t, "z0": t.t_z0, "freq": t.t_freq});
-                        let r = crate::synth::tline(&a);
-                        if let Ok(v) = &r {
-                            if let Some(w) = v.get("w_mm").and_then(|x| x.as_f64()) {
-                                t.t_w = w;
-                            }
-                        }
-                        t.t_out = r.map(|v| serde_json::to_string_pretty(&v).unwrap()).unwrap_or_else(|e| e);
-                    }
-                } else if ui.button("計算").clicked() {
-                    let a = serde_json::json!({"kind": "coax", "er": t.t_er, "d_inner_mm": t.t_d, "d_outer_mm": t.t_dd, "freq": t.t_freq});
-                    t.t_out = crate::synth::tline(&a).map(|v| serde_json::to_string_pretty(&v).unwrap()).unwrap_or_else(|e| e);
-                }
-            });
-            if !t.t_out.is_empty() {
-                ui.monospace(&t.t_out);
-            }
-        });
-        self.tools.tline_open = open;
-
-        // ---------- parameter sweep
-        let mut open = self.tools.sweep_open;
-        let mut add = false;
-        egui::Window::new("パラメータスイープ").open(&mut open).resizable(false).show(ctx, |ui| {
-            let t = &mut self.tools;
-            egui::Grid::new("sw").num_columns(2).show(ui, |ui| {
-                ui.label("部品名 / 変数");
-                ui.text_edit_singleline(&mut t.s_param);
-                ui.end_row();
-                ui.label("対象の解析");
-                ui.text_edit_singleline(&mut t.s_sim);
-                ui.end_row();
-                ui.label("開始");
-                ui.text_edit_singleline(&mut t.s_start);
-                ui.end_row();
-                ui.label("終了");
-                ui.text_edit_singleline(&mut t.s_stop);
-                ui.end_row();
-                ui.label("点数");
-                ui.text_edit_singleline(&mut t.s_points);
-                ui.end_row();
-                ui.label("刻み");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut t.s_type, 0, "lin");
-                    ui.radio_value(&mut t.s_type, 1, "log");
-                });
-                ui.end_row();
-            });
-            if ui.button("スイープを追加").clicked() {
-                add = true;
-            }
-        });
-        if add {
-            let t = &self.tools;
-            let (sim, param, a, b, n, ty) = (t.s_sim.clone(), t.s_param.clone(), t.s_start.clone(), t.s_stop.clone(), t.s_points.clone(), ["lin", "log"][t.s_type]);
-            self.doc.checkpoint();
-            match self.doc.add_parameter_sweep(&sim, &param, &a, &b, &n, ty, None) {
-                Ok(n) => {
-                    self.status = format!("{n} を追加しました");
-                    self.changed();
-                }
-                Err(e) => self.status = e,
-            }
-        }
-        self.tools.sweep_open = open;
-
-        // ---------- tuning
-        let mut open = self.tools.tune_open;
-        let mut apply: Option<usize> = None;
-        let mut remove: Option<usize> = None;
-        egui::Window::new("チューニング").open(&mut open).default_width(380.0).show(ctx, |ui| {
-            ui.small("部品またはパラメータ（SpicePar / Eqn）を選んで「追加」→ スライダーを動かすと値を書き換えて再シミュレーションします");
-            // the selected component's values first, then every parameter of the schematic
-            let mut cands: Vec<Tune> = Vec::new();
-            if self.sel.len() == 1 {
-                if let Some(c) = self.doc.sch.components.get(self.sel[0]) {
-                    cands.extend(tune_targets(c));
-                }
-            }
-            for c in self.doc.sch.components.iter().filter(|c| c.typ == "SpicePar" || c.typ == "Eqn") {
-                for t in tune_targets(c) {
-                    if !cands.iter().any(|o| o.same_target(&t)) {
-                        cands.push(t);
-                    }
-                }
-            }
-            cands.retain(|t| !self.tools.tunes.iter().any(|o| o.same_target(t)));
-            if self.tools.tune_pick >= cands.len() {
-                self.tools.tune_pick = 0;
-            }
-            ui.horizontal(|ui| {
-                let shown = cands.get(self.tools.tune_pick).map(|t| format!("{} = {}", t.label, t.value_text())).unwrap_or_else(|| "（候補なし）".into());
-                egui::ComboBox::from_id_salt("tune_pick").width(260.0).selected_text(shown).show_ui(ui, |ui| {
-                    for (i, t) in cands.iter().enumerate() {
-                        ui.selectable_value(&mut self.tools.tune_pick, i, format!("{} = {}", t.label, t.value_text()));
-                    }
-                });
-                if ui.add_enabled(!cands.is_empty(), egui::Button::new("追加")).clicked() {
-                    self.tools.tunes.push(cands.swap_remove(self.tools.tune_pick));
-                    self.tools.tune_pick = 0;
-                }
-            });
-            if cands.is_empty() && self.tools.tunes.is_empty() {
-                ui.small("数値の値を持つ部品を1つ選ぶか、SpicePar（例: Uin=1.5）を配置してください");
-            }
-            ui.checkbox(&mut self.tools.tune_auto, "値を変えたら自動でシミュレーション");
-            for (k, t) in self.tools.tunes.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(format!("{} = {}", t.label, t.value_text()));
-                    if ui.small_button("✖").clicked() {
-                        remove = Some(k);
-                    }
-                });
-                let r = ui.add(egui::Slider::new(&mut t.value, t.min..=t.max).logarithmic(t.min > 0.0).show_value(false));
-                if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                    apply = Some(k);
-                }
-            }
-        });
-        if let Some(k) = remove {
-            self.tools.tunes.remove(k);
-        }
-        if let Some(k) = apply {
-            let t = &self.tools.tunes[k];
-            let (comp, v) = (t.comp.clone(), t.text());
-            // a parameter is found again by its name, in case lines were added or removed
-            let target = self.doc.sch.component_index(&comp).and_then(|ci| {
-                let props = &self.doc.sch.components[ci].props;
-                let pi = match &t.key {
-                    Some(key) => props.iter().position(|p| p.value.split_once('=').is_some_and(|(n, _)| n.trim() == key)),
-                    None => (t.prop < props.len()).then_some(t.prop),
-                };
-                pi.map(|pi| (ci, pi))
-            });
-            if let Some((ci, prop)) = target {
-                self.doc.checkpoint();
-                self.doc.sch.components[ci].props[prop].value = v.clone();
-                self.changed();
-                self.status = format!("{comp} = {v}");
-                if self.tools.tune_auto {
-                    self.run_sim();
-                }
-            } else {
-                self.status = format!("{comp} が見つかりません（削除または名前変更された可能性があります）");
-            }
-        }
-        self.tools.tune_open = open;
-    }
-
-    // ------------------------------------------------------------------ circuit check
-
     fn refresh_issues(&mut self) {
         self.issues = check::check(&self.doc.sch, &self.conn).issues;
         if self.issue_focus.is_some_and(|point| !self.issues.iter().any(|issue| issue.at == point)) {
@@ -3250,11 +2083,7 @@ impl App {
         let shapes = std::mem::take(&mut self.scene.shapes);
         self.paint_shapes(&painter, canvas, &shapes, 1.0);
         self.scene.shapes = shapes;
-        if self.thermal_mode {
-            self.paint_thermal(&painter, canvas);
-        } else {
-            self.paint_op(&painter, canvas);
-        }
+        self.paint_thermal(&painter, canvas);
         if let Some((x, y)) = self.issue_focus {
             let point = self.to_screen(canvas, x, y);
             painter.circle_stroke(point, 13.0, Stroke::new(3.0_f32, self.pal().canvas));
@@ -3267,9 +2096,9 @@ impl App {
             Tool::Place(t) => {
                 if let Some((px, py)) = pointer {
                     let (x, y) = (snap(px.round() as i32), snap(py.round() as i32));
-                    if let Ok(mut c) = spec_component(&t, x, y) {
+                    if let Ok(mut c) = library::new_component(&t, "?", x, y) {
                         c.rotate = self.place_rot;
-                        let pl = library::place(&c, None);
+                        let pl = library::place(&c);
                         let mut ghost = Vec::new();
                         for p in &pl.prims {
                             crate::render::prim_shapes(p, &mut ghost, Some(theme::to_color(self.pal().accent)));
@@ -3278,16 +2107,7 @@ impl App {
                     }
                     if resp.clicked() {
                         self.doc.checkpoint();
-                        let (typ, props) = match t.strip_prefix("Lib:").and_then(|r| r.split_once('/')) {
-                            Some((l, c)) => {
-                                let mut m = serde_json::Map::new();
-                                m.insert("Lib".into(), serde_json::json!(l));
-                                m.insert("Comp".into(), serde_json::json!(c));
-                                ("Lib".to_string(), m)
-                            }
-                            None => (t.clone(), serde_json::Map::new()),
-                        };
-                        match self.doc.add_component(&typ, None, x, y, Some(self.place_rot), None, &props) {
+                        match self.doc.add_component(&t, None, x, y, Some(self.place_rot), None, &serde_json::Map::new()) {
                             Ok(n) => {
                                 self.status = format!("{n} を配置");
                                 self.changed();
@@ -3472,11 +2292,6 @@ impl App {
         }
         if resp.double_clicked() {
             if let Some((px, py)) = pointer {
-                if let Some(ci) = self.comp_at(px, py).filter(|&ci| self.doc.sch.components[ci].typ == "Sub") {
-                    self.sel = vec![ci];
-                    self.open_selected_sub();
-                    return;
-                }
                 if let Some(pi) = crate::edit::painting_at(&self.doc, px, py) {
                     let line = &self.doc.sch.paintings[pi];
                     if line.trim_start().starts_with("<Text") {
@@ -3728,7 +2543,7 @@ impl App {
         }
         let wants_keyboard = ctx.wants_keyboard_input();
         if (!wants_keyboard || self.property_editing) && ctx.input(|i| i.key_pressed(egui::Key::F5)) {
-            if self.thermal_mode { self.open_thermal(); } else { self.run_sim(); }
+            self.open_thermal();
             return;
         }
         if wants_keyboard {
@@ -3869,14 +2684,11 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Quit);
         }
-        self.poll_op();
         self.poll_disk();
         self.poll_open_requests();
         self.heartbeat();
-        self.poll_simulation();
         let title = format!(
-            "{} — {}{}",
-            if self.thermal_mode { "Qucs-T" } else { "Qucs-S RS" },
+            "Qucs-T — {}{}",
             self.doc.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "無題".into()),
             if self.tab_unsaved(self.active) { " *" } else { "" }
         );
@@ -3886,8 +2698,6 @@ impl eframe::App for App {
         if th != self.tex_theme {
             self.tex_theme = th;
             self.gen += 1;
-            self.simulation.invalidate_chart();
-            self.mc_textures(ctx);
         }
 
         let screen = ctx.content_rect();
@@ -3895,14 +2705,9 @@ impl eframe::App for App {
         let bar = egui::Frame::new().fill(pal.bar).inner_margin(egui::Margin::symmetric(10, 6)).stroke(egui::Stroke::new(1.0_f32, pal.border));
         egui::TopBottomPanel::top("toolbar").frame(bar).show(ctx, |ui| self.toolbar(ui));
         egui::TopBottomPanel::top("tabs").frame(egui::Frame::new().fill(pal.bar).inner_margin(egui::Margin::symmetric(10, 3))).show(ctx, |ui| self.tab_bar(ui));
-        self.simulation_notice(ctx);
         egui::TopBottomPanel::bottom("status").frame(bar.inner_margin(egui::Margin::symmetric(10, 3))).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if self.simulation_running() || self.mc.rx.is_some() {
-                    ui.spinner();
-                }
                 ui.label(&self.status);
-                self.simulation_status_button(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("ⓘ").on_hover_text("バージョン情報 (F1)").clicked() {
                         self.about_open = true;
@@ -3937,39 +2742,29 @@ impl eframe::App for App {
             });
         }
         self.issue_panel(ctx);
-        let simulation_panel_visible = if self.thermal_mode { self.thermal.open } else { self.simulation_panel(ctx) };
-        if self.simulation_panel_visible != simulation_panel_visible {
-            self.simulation_panel_visible = simulation_panel_visible;
+        let thermal_panel_visible = self.thermal.open;
+        if self.thermal_panel_visible != thermal_panel_visible {
+            self.thermal_panel_visible = thermal_panel_visible;
             self.need_fit = true;
         }
         let palette_max_width = (screen.width() * 0.42).max(120.0);
         let lw = egui::SidePanel::left("palette").default_width(self.settings.left_panel).width_range(120.0..=palette_max_width)
-            .show(ctx, |ui| self.palette(ui)).response.rect.width();
-        if !self.thermal_mode || !self.thermal.open {
+            .show(ctx, |ui| self.thermal_palette(ui)).response.rect.width();
+        if !self.thermal.open {
             self.settings.right_panel = egui::SidePanel::right("props").default_width(self.settings.right_panel)
                 .show(ctx, |ui| self.properties(ui)).response.rect.width();
         }
-        if self.thermal_mode {
-            self.thermal_panel(ctx);
-        }
+        self.thermal_panel(ctx);
         self.settings.left_panel = lw;
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
             let canvas = ui.max_rect();
             self.keys(ctx, canvas);
             self.canvas(ui);
         });
-        if !self.thermal_mode {
-            self.simulation_window(ctx);
-        } else {
-            self.cylinder_window(ctx);
-            self.temperature_map_window(ctx);
-        }
-        self.tool_windows(ctx);
-        self.mc_window(ctx);
-        self.op_window(ctx);
+        self.cylinder_window(ctx);
+        self.temperature_map_window(ctx);
         self.find_window(ctx);
         self.about_window(ctx);
-        self.subckt_dialog(ctx);
         self.confirm_dialog(ctx);
         self.external_change_dialog(ctx);
         if let Some((pos, mut text, editing)) = self.text_prompt.take() {
@@ -4031,7 +2826,6 @@ impl eframe::App for App {
                 self.label_prompt = Some((t, text));
             }
         }
-        self.start_requested_simulation(ctx);
         self.drive_shot(ctx);
         // keep polling the file even when idle
         ctx.request_repaint_after(std::time::Duration::from_millis(350));
@@ -4042,7 +2836,7 @@ impl Drop for App {
     fn drop(&mut self) {
         self.store_settings();
         // no longer accepting files: let the next launch open its own window
-        let path = crate::mcp::gui_heartbeat_path(self.thermal_mode);
+        let path = crate::mcp::gui_heartbeat_path();
         if std::fs::read_to_string(&path).ok().as_deref() == Some(std::process::id().to_string().as_str()) {
             let _ = std::fs::remove_file(path);
         }
@@ -4053,38 +2847,4 @@ impl Drop for App {
 fn wire_cover(wires: &[crate::schematic::Wire], moved: &[crate::schematic::Wire]) -> Vec<usize> {
     let inside = |w: &crate::schematic::Wire, p: (i32, i32)| (w.x1.min(w.x2)..=w.x1.max(w.x2)).contains(&p.0) && (w.y1.min(w.y2)..=w.y1.max(w.y2)).contains(&p.1);
     wires.iter().enumerate().filter(|(_, w)| moved.iter().any(|m| inside(m, w.p1()) && inside(m, w.p2()) || inside(w, m.p1()) && inside(w, m.p2()))).map(|(i, _)| i).collect()
-}
-
-#[cfg(test)]
-mod tune_tests {
-    use super::*;
-
-    #[test]
-    fn spice_parameters_are_tunable() {
-        let mut c = crate::library::new_component("SpicePar", "SpicePar1", 0, 0).unwrap();
-        c.props = vec![
-            crate::schematic::Prop { value: "Uin=1.5".into(), display: "1".into() },
-            crate::schematic::Prop { value: "Rl=2k".into(), display: "1".into() },
-        ];
-        let t = tune_targets(&c);
-        assert_eq!(t.len(), 2);
-        assert_eq!(t[0].key.as_deref(), Some("Uin"));
-        assert_eq!(t[1].label, "SpicePar1: Rl");
-        assert_eq!(t[1].text(), "Rl=2k");
-        let mut big = Tune { value: 4.7e6, ..tune_targets(&c).remove(1) };
-        assert_eq!(big.text(), "Rl=4.7Meg");
-        big.value = 3.3e-3;
-        assert_eq!(big.text(), "Rl=3.3m");
-    }
-
-    #[test]
-    fn every_numeric_property_is_offered() {
-        let c = crate::library::new_component("R", "R1", 0, 0).unwrap();
-        let t = tune_targets(&c);
-        assert!(!t.is_empty());
-        assert!(t.iter().all(|t| t.key.is_none()));
-        assert!(t[0].label.starts_with("R1."), "{}", t[0].label);
-        assert_eq!(value_unit("10 pF"), "F");
-        assert_eq!(value_unit("1 MegOhm"), "Ohm");
-    }
 }

@@ -15,15 +15,11 @@ GROUPS = [
     ("Thermal networks", ["new_thermal_schematic", "generate_thermal_cylinder", "get_thermal_settings",
                           "set_thermal_settings", "run_thermal_analysis", "get_thermal_results",
                           "export_thermal_csv", "run_thermal_sweep"]),
-    ("Components", ["list_component_types", "get_component_type", "search_library", "add_components", "update_component",
+    ("Components", ["list_component_types", "get_component_type", "add_components", "update_component",
                     "move_components", "duplicate_components", "align_components", "delete_components"]),
     ("Wiring", ["connect", "add_wire", "delete_wires", "add_net_label", "reroute", "tidy"]),
     ("Drawings", ["add_painting", "delete_paintings"]),
     ("Inspection", ["snapshot", "check_layout"]),
-    ("Hierarchy", ["create_subcircuit", "open_subcircuit"]),
-    ("Simulation", ["add_simulation", "add_parameter_sweep", "get_netlist", "run_simulation", "dc_operating_point",
-                    "get_results", "plot_results", "run_monte_carlo"]),
-    ("Design tools", ["design_filter", "design_attenuator", "calc_transmission_line"]),
     ("Editor", ["open_gui", "get_gui_state"]),
 ]
 
@@ -49,7 +45,7 @@ def main():
 
     out = ["# MCP tool reference", "",
            f"Generated from `qucs-t mcp` ({init['serverInfo'].get('version', '')}) by `tools/gen_mcp_docs.py` — do not edit by hand.", "",
-           "Coordinates are Qucs units (x right, **y down**, 10-unit grid). Terminals: `\"R1.1\"`, `\"V1.+\"`, `\"OP1.OUT\"`, "
+           "Coordinates are Qucs units (x right, **y down**, 10-unit grid). Terminals: `\"Rth1.1\"`, "
            "points `\"[x,y]\"`, nets `\"net:name\"`.", ""]
     if init.get("instructions"):
         out += ["## Recommended workflow", "", init["instructions"], ""]

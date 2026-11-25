@@ -2,17 +2,17 @@
 
 Generated from `qucs-t mcp` (0.1.0) by `tools/gen_mcp_docs.py` — do not edit by hand.
 
-Coordinates are Qucs units (x right, **y down**, 10-unit grid). Terminals: `"R1.1"`, `"V1.+"`, `"OP1.OUT"`, points `"[x,y]"`, nets `"net:name"`.
+Coordinates are Qucs units (x right, **y down**, 10-unit grid). Terminals: `"Rth1.1"`, points `"[x,y]"`, nets `"net:name"`.
 
 ## Recommended workflow
 
-Qucs-T thermal simulator and Qucs-S schematic editor. Coordinates are Qucs units: x to the right, y DOWN, 10-unit grid. Pins are addressed as "R1.1", "V1.+", "OP1.OUT"; points as "[x,y]"; nets as "net:name". For thermal circuits, start with new_thermal_schematic, open_schematic (.qucst), or generate_thermal_cylinder. Use list_component_types with category thermal, get_component_type for property names and defaults, then add_components/update_component/connect. Use run_thermal_analysis for steady and transient analysis, get_thermal_results for signals and samples, or export_thermal_csv. Electrical workflow: new_schematic -> add_components (signal left->right, supply at top, ground at bottom, leave >= 60 units between parts) -> connect (one call per net; the router avoids symbols, never overlaps other nets and keeps bends low) -> add_net_label for nodes you want to observe -> snapshot (look at the picture! it is exactly what the editor shows) -> check_layout -> fix with move_components / reroute / tidy -> add_simulation -> run_simulation -> get_results / plot_results (dc_operating_point gives node voltages without any simulation block). Large designs: create_subcircuit moves parts into their own file (open_subcircuit descends). Every edit is saved immediately; open_gui shows the live editor to the user.
+Qucs-T thermal network simulator and schematic editor. Coordinates are Qucs units: x to the right, y down, 10-unit grid. Pins are addressed as "Rth1.1", points as "[x,y]", and nets as "net:name". Start with new_thermal_schematic, open_schematic (.qucst), or generate_thermal_cylinder. Use list_component_types and get_component_type for thermal elements, then add_components, update_component, and connect. Use check_layout and snapshot to inspect the layout, and reroute or tidy to adjust it. Use run_thermal_analysis for steady and transient analysis, get_thermal_results for signals and samples, or export_thermal_csv. Edits are saved automatically. Use open_gui to show the live editor.
 
 ## Files
 
 ### `new_schematic`
 
-Create a new empty schematic file (overwrites only if overwrite=true).
+Create a new empty Qucs-T .qucst file (overwrites only if overwrite=true).
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -21,7 +21,7 @@ Create a new empty schematic file (overwrites only if overwrite=true).
 
 ### `open_schematic`
 
-Open a Qucs-T .qucst or Qucs-S .sch file.
+Open a Qucs-T .qucst file.
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -135,7 +135,7 @@ Regenerate and analyze the saved cylinder configuration at each sweep value. Opt
 
 ### `list_component_types`
 
-Search component types. Use category thermal for Qucs-T thermal elements.
+Search thermal component types.
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -149,16 +149,6 @@ Properties (name/default/description), pins and symbol size of a component type.
 | parameter | type | required | description |
 |---|---|---|---|
 | `type` | string | yes |  |
-
-### `search_library`
-
-Search the Qucs-S component libraries (real parts: op-amps, transistors, diodes, regulators, transformers, ...). Returns lib/comp names, description, pins and parameters; place with add_components {type:"Lib", lib, comp}.
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `query` | string |  | words to match, e.g. "lm358", "zener 5v", "mosfet irf" |
-| `lib` | string |  | restrict to one library |
-| `limit` | integer |  |  |
 
 ### `add_components`
 
@@ -182,7 +172,7 @@ Change properties, orientation, position or name of a component (wires are NOT m
 | `y` | integer |  |  |
 | `new_name` | string |  |  |
 | `mirror_y` | boolean |  | mirror about the Y axis (left-right) |
-| `active` | integer |  | 1 active, 0 off, 2 shorted (electrical only) |
+| `active` | integer |  | 1 active, 0 off |
 | `label_offset` | integer[] |  | [tx, ty] text position relative to the component |
 
 ### `move_components`
@@ -226,13 +216,12 @@ Delete components (and optionally the wires of nets left without pins).
 
 ### `connect`
 
-Auto-route wires. Each entry of `nets` is a list of terminals that become one net ("R1.2", "[x,y]", "net:name"). Optional labels give the net a name.
+Auto-route wires. Each entry of `nets` is a list of terminals that become one net ("Rth1.2", "[x,y]", "net:name"). Optional labels give the net a name.
 
 | parameter | type | required | description |
 |---|---|---|---|
 | `nets` | string[][] | yes |  |
 | `labels` | string[] |  | net label per entry of nets ("" for none) |
-| `flip_passives` | boolean |  | turn unwired R/C/L by 180° when that shortens wires (default true) |
 | `improve` | boolean |  | rip-up-and-retry pass to reduce crossings/bends (default true) |
 
 ### `add_wire`
@@ -255,7 +244,7 @@ Delete wires by index, by net name, or all.
 
 ### `add_net_label`
 
-Name a net (label placed automatically in free space). Same names connect nets; results are v(<label>).
+Name a net (label placed automatically in free space). Same names connect nets, and the label identifies the node in temperature results.
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -330,176 +319,6 @@ Render the schematic exactly as the editor draws it (PNG). Overlays help reasoni
 ### `check_layout`
 
 Find problems: unconnected pins, pins/wire ends on the middle of wires (look connected but are not), overlapping parts or wires, wires through symbols, overlapping text, off-grid items. Also returns wiring metrics.
-
-## Hierarchy
-
-### `create_subcircuit`
-
-Move the given components into a new subcircuit schematic (Qucs Sub with numbered Ports for every net that leaves the selection) and replace them with a Sub component wired to the same nets. Returns the ports (number -> net).
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `components` | string[] | yes |  |
-| `file` | string | yes | subcircuit file, relative to the current schematic, e.g. "amp_stage.sch" |
-| `overwrite` | boolean |  |  |
-
-### `open_subcircuit`
-
-Open the schematic behind a Sub component (descend into the hierarchy). open_schematic the parent again to go back up.
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `name` | string | yes | Sub component name |
-
-## Simulation
-
-### `add_simulation`
-
-Add a simulation block: kind tr|ac|dc|sweep|noise|fourier|... with properties, e.g. {"kind":"tr","props":{"Stop":"3 ms","Points":"601"}} or ac {"Type":"log","Start":"10 Hz","Stop":"10 MHz","Points":"301"}.
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `kind` | string | yes |  |
-| `props` | object |  |  |
-| `x` | integer |  |  |
-| `y` | integer |  |  |
-
-### `add_parameter_sweep`
-
-Sweep a component value (param = component name, e.g. "R1", "C2", "V1") or a variable (created in a .PARAM block if missing; use {name} in component values) over an existing analysis (sim = "TR1", "AC1", "DC1"...). Results come back as one analysis per step (plot_results overlays them).
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `sim` | string | yes |  |
-| `param` | string | yes |  |
-| `start` | string | yes |  |
-| `stop` | string | yes |  |
-| `points` | string |  |  |
-| `type` | string |  | lin (default) \| log \| list |
-| `default` | string |  | value for a newly created variable |
-
-### `get_netlist`
-
-The ngspice netlist of the current schematic (built-in netlister; Qucs-S is used for parts it cannot translate). netlister = auto | builtin | qucs-s.
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `netlister` | string |  |  |
-
-### `run_simulation`
-
-Run ngspice. Returns a summary of every analysis. The netlist comes from the built-in netlister (TR, AC, DC operating point; R/L/C, sources, diodes, BJT, MOSFET, JFET, op-amp, controlled sources, probes, B-sources, subcircuits); other analyses or parts are netlisted by Qucs-S when it is installed.
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `timeout_s` | integer |  |  |
-
-### `dc_operating_point`
-
-DC operating point: the voltage of every net and the current through every voltage source / probe. Needs no simulation block. The editor can show the voltages on the schematic (button "動作点").
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `timeout_s` | integer |  |  |
-
-### `get_results`
-
-Values of result vectors: summary, values at given x positions, or a decimated table.
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `analysis` | string |  |  |
-| `vectors` | string[] |  |  |
-| `at` | number[] |  |  |
-| `points` | integer |  | table rows (decimated) |
-
-### `plot_results`
-
-Result diagram like Qucs-S: kind rect (default; AC shows dB + phase), polar, smith (reflection coefficients) or table. markers = x values (time / frequency) to read off: the values are returned as numbers too. Sweeps overlay all steps.
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `analysis` | string |  |  |
-| `vectors` | string[] |  |  |
-| `kind` | string |  | rect \| polar \| smith \| table |
-| `markers` | number[] |  |  |
-| `db` | boolean |  |  |
-| `phase` | boolean |  |  |
-| `x_log` | boolean |  |  |
-| `y_log` | boolean |  |  |
-| `x_range` | number[] |  |  |
-| `y_range` | number[] |  |  |
-| `z0` | number |  |  |
-| `title` | string |  |  |
-
-### `run_monte_carlo`
-
-Monte Carlo / tolerance analysis: runs the existing simulation N times (in parallel) with R/C/L values randomly varied. Returns statistics of the vectors at the given x points (mean, std, min/max, 1/50/99 percentiles; complex values in dB), the yield against limits, an overlay of all runs and a histogram.
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `runs` | integer |  | default 50 (run 0 = nominal) |
-| `tolerances` | object |  | percent: by element letter {"R":1,"C":5,"L":10} and/or per component {"C3":20, "R1":0} |
-| `distribution` | string |  | gauss (tolerance = 3 sigma, default) \| uniform |
-| `seed` | integer |  |  |
-| `analysis` | string |  |  |
-| `vectors` | string[] |  |  |
-| `at` | number[] |  | x values to measure at (frequency / time) |
-| `limits` | object[] |  | pass/fail limits for the yield (dB for complex vectors) |
-
-## Design tools
-
-### `design_filter`
-
-LC ladder filter synthesis (like qucs-sfilter) placed into the schematic and wired. response butterworth|chebyshev|bessel, class lowpass|highpass|bandpass|bandstop, order, f1 (corner / lower edge), f2 (upper edge), z0. test_bench=true adds source, load and an AC sweep.
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `response` | string |  |  |
-| `ripple_db` | number |  |  |
-| `class` | string |  |  |
-| `order` | integer |  |  |
-| `f1` | string | yes | e.g. "10 MHz" |
-| `f2` | string |  |  |
-| `z0` | number |  |  |
-| `first_series` | boolean |  | T start (series element first) instead of PI |
-| `x` | integer |  |  |
-| `y` | integer |  |  |
-| `place` | boolean |  | default true; false = only compute values |
-| `test_bench` | boolean |  |  |
-
-### `design_attenuator`
-
-Resistive attenuator (like qucs-sattenuator): topology pi|tee|bridged_tee, atten_db, z_in, z_out. Placed and wired unless place=false.
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `topology` | string |  |  |
-| `atten_db` | number | yes |  |
-| `z_in` | number |  |  |
-| `z_out` | number |  |  |
-| `x` | integer |  |  |
-| `y` | integer |  |  |
-| `place` | boolean |  |  |
-| `test_bench` | boolean |  |  |
-
-### `calc_transmission_line`
-
-Transmission line calculator (like qucs-strans). microstrip: er, h_mm, t_um, and w_mm (analyse) or z0 (synthesise width); freq for dispersion and lengths (electrical_deg -> length_mm, length_mm -> degrees). coax: er, d_inner_mm, d_outer_mm.
-
-| parameter | type | required | description |
-|---|---|---|---|
-| `kind` | string |  |  |
-| `er` | number |  |  |
-| `h_mm` | number |  |  |
-| `t_um` | number |  |  |
-| `w_mm` | number |  |  |
-| `z0` | number |  |  |
-| `freq` | string |  |  |
-| `length_mm` | number |  |  |
-| `electrical_deg` | number |  |  |
-| `d_inner_mm` | number |  |  |
-| `d_outer_mm` | number |  |  |
 
 ## Editor
 

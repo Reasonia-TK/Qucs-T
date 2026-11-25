@@ -187,25 +187,6 @@ impl Palette {
         Color32::from_rgba_unmultiplied(r, g, b, (c.3 as f32 * alpha) as u8)
     }
 
-    /// Recolor a premultiplied RGBA image (rendered on white) for this theme.
-    pub fn map_image(&self, rgba: &[u8]) -> Vec<u8> {
-        let mut out = rgba.to_vec();
-        let mut cache: std::collections::HashMap<[u8; 3], [u8; 3]> = std::collections::HashMap::new();
-        for px in out.as_chunks_mut::<4>().0 {
-            let a = px[3];
-            if a == 0 {
-                continue;
-            }
-            let un = |v: u8| if a == 255 { v } else { ((v as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8 };
-            let key = [un(px[0]), un(px[1]), un(px[2])];
-            let m = *cache.entry(key).or_insert_with(|| self.map_rgb(key, true));
-            for k in 0..3 {
-                px[k] = if a == 255 { m[k] } else { ((m[k] as u32 * a as u32 + 127) / 255) as u8 };
-            }
-        }
-        out
-    }
-
     pub fn visuals(&self) -> egui::Visuals {
         let mut v = if self.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
         let r = CornerRadius::same(5);

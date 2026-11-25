@@ -17,7 +17,6 @@ pub struct Settings {
     pub auto_reroute: bool,
     /// most recent first
     pub recent: Vec<String>,
-    pub part_favorites: Vec<String>,
     pub left_panel: f32,
     pub right_panel: f32,
 }
@@ -32,7 +31,6 @@ impl Default for Settings {
             auto_save: false,
             auto_reroute: true,
             recent: vec![],
-            part_favorites: crate::palette::DEFAULT_FAVORITES.iter().map(|part| (*part).to_string()).collect(),
             left_panel: 230.0,
             right_panel: 290.0,
         }
@@ -104,13 +102,13 @@ mod tests {
     fn recent_list_is_mru_and_bounded() {
         let mut s = Settings::default();
         for k in 0..20 {
-            s.add_recent(Path::new(&format!("C:/x/f{k}.sch")));
+            s.add_recent(Path::new(&format!("C:/x/f{k}.qucst")));
         }
         assert_eq!(s.recent.len(), MAX_RECENT);
-        assert!(s.recent[0].ends_with("f19.sch"));
-        s.add_recent(Path::new("C:/x/f15.sch"));
-        assert!(s.recent[0].ends_with("f15.sch"));
-        assert_eq!(s.recent.iter().filter(|r| r.ends_with("f15.sch")).count(), 1);
+        assert!(s.recent[0].ends_with("f19.qucst"));
+        s.add_recent(Path::new("C:/x/f15.qucst"));
+        assert!(s.recent[0].ends_with("f15.qucst"));
+        assert_eq!(s.recent.iter().filter(|r| r.ends_with("f15.qucst")).count(), 1);
     }
 
     #[test]
@@ -119,7 +117,6 @@ mod tests {
         assert!(!s.show_grid);
         assert!(!s.auto_save);
         assert_eq!(s.left_panel, 230.0);
-        assert_eq!(s.part_favorites, crate::palette::DEFAULT_FAVORITES);
     }
 
     #[test]
@@ -130,12 +127,11 @@ mod tests {
 
     #[test]
     fn save_and_load_round_trip() {
-        let p = std::env::temp_dir().join(format!("qucs-rs-settings-{}.json", std::process::id()));
+        let p = std::env::temp_dir().join(format!("qucs-t-settings-{}.json", std::process::id()));
         std::env::set_var("QUCS_RS_SETTINGS", &p);
         let mut s = Settings::default();
         s.color_nets = true;
-        s.part_favorites = vec!["Lib:OpAmps/LM358".into()];
-        s.add_recent(Path::new("C:/a.sch"));
+        s.add_recent(Path::new("C:/a.qucst"));
         s.save();
         assert_eq!(Settings::load(), s);
         let _ = std::fs::remove_file(&p);

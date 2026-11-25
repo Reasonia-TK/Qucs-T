@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "qucs-s-rs": {
+    "qucs-t": {
       "command": "cmd",
-      "args": ["/c", "tools\\qucs-s-rs-mcp.cmd"]
+      "args": ["/c", "tools\\qucs-t-mcp.cmd"]
     }
   }
 }

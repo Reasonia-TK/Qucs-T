@@ -1,4 +1,4 @@
-//! Unit tests of the core: .sch parsing / writing, connectivity rules, editing
+//! Unit tests of the core: .qucst parsing / writing, connectivity rules, editing
 //! operations with undo, and the router's layout guarantees.
 
 use crate::check;
@@ -8,15 +8,15 @@ use crate::schematic::{tokenize, unquote, Schematic, Wire};
 use serde_json::Map;
 use std::collections::HashSet;
 
-const MINI: &str = "<Qucs Schematic 24.4.0>
+const MINI: &str = "<Qucs-T Schematic 1>
 <Properties>
   <View=0,0,800,600,1,0,0>
 </Properties>
 <Symbol>
 </Symbol>
 <Components>
-  <R R1 1 100 100 -26 15 0 0 \"10 k\" 1 \"26.85\" 0 \"0.0\" 0 \"0.0\" 0 \"26.85\" 0 \"european\" 0>
-  <GND * 1 200 200 0 0 0 0>
+  <ThResistance R1 1 100 100 -26 15 0 0 \"hot wall\" 1 \"伝導\" 0 \"2\" 0>
+  <ThBoundary * 1 200 230 18 -12 0 0>
 </Components>
 <Wires>
   <130 100 200 100 \"out\" 160 70 0 \"\">
@@ -45,9 +45,8 @@ fn net_of(c: &Connectivity, pin: &str) -> String {
 #[test]
 fn parse_and_write_keep_everything() {
     let s = Schematic::parse(MINI).unwrap();
-    assert_eq!(s.version, "24.4.0");
     assert_eq!(s.components.len(), 2);
-    assert_eq!(s.components[0].props[0].value, "10 k");
+    assert_eq!(s.components[0].props[0].value, "hot wall");
     assert_eq!(s.wires[0].label, "out");
     assert_eq!(s.paintings.len(), 1);
     assert_eq!(s.extra_sections, vec![("FutureSection".to_string(), vec!["  keep me".to_string()])]);
@@ -62,6 +61,7 @@ fn parse_and_write_keep_everything() {
 fn rejects_non_schematics() {
     assert!(Schematic::parse("").is_err());
     assert!(Schematic::parse("hello\n<Components>\n</Components>").is_err());
+    assert!(Schematic::parse("<Qucs Schematic 26.1.1>").is_err());
 }
 
 #[test]
@@ -72,9 +72,9 @@ fn tokenizer_keeps_quoted_spaces() {
 }
 
 #[test]
-fn grounds_get_unique_hidden_names() {
+fn unnamed_parts_get_unique_hidden_names() {
     let d = Doc::new(Schematic::parse(MINI).unwrap(), None);
-    let g = d.sch.components.iter().find(|c| c.typ == "GND").unwrap();
+    let g = d.sch.components.iter().find(|c| c.typ == "ThBoundary").unwrap();
     assert_ne!(g.name, "*");
     assert!(g.active & 4 != 0, "name stays hidden like Qucs' '*'");
 }
@@ -82,42 +82,43 @@ fn grounds_get_unique_hidden_names() {
 // ------------------------------------------------------------------ connectivity
 
 #[test]
-fn labels_and_ground_define_nets() {
+fn wire_labels_and_pins_define_nets() {
     let d = Doc::new(Schematic::parse(MINI).unwrap(), None);
     let c = d.conn();
-    // R1.2 touches the labelled wire, which reaches the ground symbol
-    assert_eq!(net_of(&c, "R1.2"), "gnd");
+    // R1.2 touches the labelled wire, which reaches the temperature boundary
+    assert_eq!(net_of(&c, "R1.2"), "out");
+    assert_eq!(net_of(&c, "T1.1"), "out");
     // R1.1 is not connected to anything: an auto-named net of its own
     assert!(net_of(&c, "R1.1").starts_with("_net"));
 }
 
 #[test]
 fn pin_in_the_middle_of_a_wire_is_not_connected() {
-    let mut s = Schematic::new_empty("t");
-    s.components.push(crate::library::new_component("R", "R1", 100, 100).unwrap()); // pins at 70 and 130
+    let mut s = crate::thermal::empty();
+    s.components.push(crate::library::new_component("ThResistance", "R1", 100, 100).unwrap()); // pins at 70 and 130
     s.wires.push(Wire::new(0, 100, 200, 100)); // passes through both pins
-    let c = Connectivity::build(&s, None);
+    let c = Connectivity::build(&s);
     let wnet = c.wire_net[0];
     assert_ne!(c.find_pin("R1.1").unwrap().net, wnet);
     assert_ne!(c.find_pin("R1.2").unwrap().net, wnet);
     // after splitting the wire at the pins they are connected (what the router does)
     let mut s2 = s.clone();
     s2.wires = split_wires_at(split_wires_at(s2.wires, (70, 100)), (130, 100));
-    let c2 = Connectivity::build(&s2, None);
+    let c2 = Connectivity::build(&s2);
     assert_eq!(c2.find_pin("R1.1").unwrap().net, c2.find_pin("R1.2").unwrap().net);
 }
 
 #[test]
 fn same_label_joins_separate_islands() {
-    let mut s = Schematic::new_empty("t");
-    s.components.push(crate::library::new_component("R", "R1", 100, 100).unwrap());
-    s.components.push(crate::library::new_component("R", "R2", 400, 100).unwrap());
+    let mut s = crate::thermal::empty();
+    s.components.push(crate::library::new_component("ThResistance", "R1", 100, 100).unwrap());
+    s.components.push(crate::library::new_component("ThResistance", "R2", 400, 100).unwrap());
     let mut a = Wire::new(130, 100, 180, 100);
     a.label = "mid".into();
     let mut b = Wire::new(320, 100, 370, 100);
     b.label = "mid".into();
     s.wires = vec![a, b];
-    let c = Connectivity::build(&s, None);
+    let c = Connectivity::build(&s);
     assert_eq!(net_of(&c, "R1.2"), "mid");
     assert_eq!(net_of(&c, "R2.1"), "mid");
     assert_eq!(c.find_pin("R1.2").unwrap().net, c.find_pin("R2.1").unwrap().net);
@@ -144,23 +145,24 @@ fn snapping() {
 // ------------------------------------------------------------------ editing
 
 fn rc_doc() -> Doc {
-    let mut d = Doc::new(Schematic::new_empty("t"), None);
-    d.add_component("Vdc", Some("V1"), 0, 100, None, None, &none()).unwrap();
-    d.add_component("R", Some("R1"), 150, 40, None, None, &none()).unwrap();
-    d.add_component("C", Some("C1"), 260, 120, Some(1), None, &none()).unwrap();
-    d.add_component("GND", None, 0, 220, None, None, &none()).unwrap();
-    d.connect(&["V1.+".into(), "R1.1".into()], Some("in")).unwrap();
-    d.connect(&["R1.2".into(), "C1.2".into()], Some("out")).unwrap();
-    d.connect(&["V1.-".into(), "C1.1".into(), "GND1.1".into()], None).unwrap();
+    let mut d = Doc::new(crate::thermal::empty(), None);
+    d.add_component("ThPower", Some("P1"), 0, 100, None, None, &none()).unwrap();
+    d.add_component("ThResistance", Some("R1"), 150, 40, None, None, &none()).unwrap();
+    d.add_component("ThResistance", Some("Rth2"), 260, 120, Some(1), None, &none()).unwrap();
+    d.add_component("ThCapacity", Some("C1"), 410, 50, None, None, &none()).unwrap();
+    d.add_component("ThBoundary", Some("T1"), 0, 220, None, None, &none()).unwrap();
+    d.connect(&["P1.1".into(), "R1.1".into()], Some("in")).unwrap();
+    d.connect(&["R1.2".into(), "Rth2.2".into(), "C1.1".into()], Some("out")).unwrap();
+    d.connect(&["Rth2.1".into(), "T1.1".into()], Some("ambient")).unwrap();
     d
 }
 
 #[test]
 fn duplicate_names_are_refused() {
     let mut d = rc_doc();
-    assert!(d.add_component("R", Some("R1"), 500, 500, None, None, &none()).is_err());
-    let n = d.add_component("R", None, 500, 500, None, None, &none()).unwrap();
-    assert_eq!(n, "R2");
+    assert!(d.add_component("ThResistance", Some("R1"), 500, 500, None, None, &none()).is_err());
+    let n = d.add_component("ThResistance", None, 500, 500, None, None, &none()).unwrap();
+    assert_eq!(n, "Rth1");
 }
 
 #[test]
@@ -182,10 +184,10 @@ fn undo_redo_restores_exact_states() {
 #[test]
 fn moving_parts_reroutes_and_keeps_nets() {
     let mut d = rc_doc();
-    let nets_before: Vec<String> = ["R1.1", "R1.2", "C1.1", "C1.2"].iter().map(|p| net_of(&d.conn(), p)).collect();
+    let nets_before: Vec<String> = ["R1.1", "R1.2", "C1.1", "Rth2.1"].iter().map(|p| net_of(&d.conn(), p)).collect();
     d.move_components(&[("C1".into(), 400, 260)], true).unwrap();
     let c = d.conn();
-    let nets_after: Vec<String> = ["R1.1", "R1.2", "C1.1", "C1.2"].iter().map(|p| net_of(&c, p)).collect();
+    let nets_after: Vec<String> = ["R1.1", "R1.2", "C1.1", "Rth2.1"].iter().map(|p| net_of(&c, p)).collect();
     assert_eq!(nets_before, nets_after);
     let rep = check::check(&d.sch, &c);
     assert_eq!(rep.metrics["errors"], 0, "{:?}", rep.issues);
@@ -207,7 +209,7 @@ fn reroute_everything_is_clean() {
     d.reroute(&[]).unwrap();
     let c = d.conn();
     assert_eq!(net_of(&c, "R1.2"), "out");
-    assert_eq!(net_of(&c, "C1.1"), "gnd");
+    assert_eq!(net_of(&c, "T1.1"), "ambient");
     let rep = check::check(&d.sch, &c);
     assert_eq!(rep.metrics["errors"], 0, "{:?}", rep.issues);
 }
@@ -218,12 +220,12 @@ fn reroute_everything_is_clean() {
 /// must not touch foreign pins and must keep every wire orthogonal.
 #[test]
 fn router_avoids_symbols_and_foreign_nets() {
-    let mut d = Doc::new(Schematic::new_empty("t"), None);
+    let mut d = Doc::new(crate::thermal::empty(), None);
     let mut names = Vec::new();
     for row in 0..3 {
         for col in 0..3 {
             let n = format!("R{}", row * 3 + col + 1);
-            d.add_component("R", Some(&n), 100 + col * 160, 100 + row * 140, Some((row + col) % 2), None, &none()).unwrap();
+            d.add_component("ThResistance", Some(&n), 100 + col * 160, 100 + row * 140, Some((row + col) % 2), None, &none()).unwrap();
             names.push(n);
         }
     }
@@ -251,13 +253,4 @@ fn router_avoids_symbols_and_foreign_nets() {
             assert!(!inside(mid.0, mid.1), "wire {w:?} crosses {}", d.sch.components[ci].name);
         }
     }
-}
-
-#[test]
-fn unsaved_copy_shares_the_work_dir_of_its_original() {
-    let orig = std::path::Path::new("C:/x/amp.sch");
-    let tmp = crate::sim::unsaved_copy_path(orig, "sim").unwrap();
-    assert_eq!(tmp.parent(), orig.parent());
-    assert_ne!(tmp, orig);
-    assert_eq!(crate::sim::work_dir(&tmp, "sim").unwrap(), crate::sim::work_dir(orig, "sim").unwrap());
 }

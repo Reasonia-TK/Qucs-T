@@ -1,4 +1,4 @@
-//! Qucs-S schematic (.sch) model: parsing and serialisation.
+//! Qucs-T schematic (.qucst) model: parsing and serialisation.
 //!
 //! Components and wires are modelled; every other section (Properties, Symbol,
 //! Diagrams, Paintings) is kept verbatim so files round-trip safely.
@@ -6,7 +6,6 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-pub const DEFAULT_VERSION: &str = "26.1.1";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prop {
@@ -215,7 +214,6 @@ impl Wire {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Schematic {
-    pub version: String,
     pub properties: Vec<String>,
     pub symbol: Vec<String>,
     pub components: Vec<Component>,
@@ -226,15 +224,10 @@ pub struct Schematic {
 }
 
 impl Schematic {
-    pub fn new_empty(dataset_stem: &str) -> Schematic {
+    pub fn new_empty() -> Schematic {
         let props = [
             "<View=0,0,1200,900,1,0,0>".to_string(),
             "<Grid=10,10,1>".into(),
-            format!("<DataSet={dataset_stem}.dat>"),
-            format!("<DataDisplay={dataset_stem}.dpl>"),
-            "<OpenDisplay=0>".into(),
-            "<Script=>".into(),
-            "<RunScript=0>".into(),
             "<showFrame=0>".into(),
             "<FrameText0=Title>".into(),
             "<FrameText1=Drawn By:>".into(),
@@ -242,14 +235,13 @@ impl Schematic {
             "<FrameText3=Revision:>".into(),
         ];
         Schematic {
-            version: DEFAULT_VERSION.into(),
             properties: props.iter().map(|s| format!("  {s}")).collect(),
             ..Default::default()
         }
     }
 
     pub fn parse(text: &str) -> Result<Schematic, String> {
-        let mut sch = Schematic { version: DEFAULT_VERSION.into(), ..Default::default() };
+        let mut sch = Schematic::default();
         let mut section: Option<String> = None;
         let mut saw_header = false;
         for raw in text.lines() {
@@ -263,16 +255,10 @@ impl Schematic {
                     if v != "1" {
                         return Err(format!("この Qucs-T ファイルのバージョンには対応していません ({v})"));
                     }
-                    sch.version = crate::thermal::VERSION.into();
                     saw_header = true;
                     continue;
                 }
-                if let Some(v) = t.strip_prefix("<Qucs Schematic") {
-                    sch.version = v.trim_end_matches('>').trim().to_string();
-                    saw_header = true;
-                    continue;
-                }
-                return Err("not a Qucs schematic (missing '<Qucs Schematic ...>' header)".into());
+                return Err("Qucs-T の熱回路ファイル (.qucst) を指定してください".into());
             }
             if let Some(sec) = section.clone() {
                 if t == format!("</{sec}>") {
@@ -312,18 +298,8 @@ impl Schematic {
         Ok(sch)
     }
 
-    pub fn load(path: &Path) -> Result<Schematic, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let text = String::from_utf8_lossy(&bytes);
-        Schematic::parse(&text)
-    }
-
     pub fn serialize(&self) -> String {
-        let mut s = if self.version == crate::thermal::VERSION {
-            "<Qucs-T Schematic 1>\n".to_string()
-        } else {
-            format!("<Qucs Schematic {}>\n", self.version)
-        };
+        let mut s = "<Qucs-T Schematic 1>\n".to_string();
         let raw = |name: &str, lines: &[String], s: &mut String| {
             let _ = writeln!(s, "<{name}>");
             for l in lines {
@@ -361,6 +337,7 @@ impl Schematic {
     fn write(&self, path: &Path, expected: Option<Option<&[u8]>>) -> Result<Vec<u8>, String> {
         // The editor and MCP server use the same lock, so checking and replacing a
         // file are one operation for app writers. The OS releases it on process exit.
+        // Share the lock with earlier Qucs-T builds that may edit the same file.
         let lock_path = std::env::temp_dir().join("qucs-s-rs-schematic.lock");
         let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock_path)
             .map_err(|e| format!("cannot open schematic write lock: {e}"))?;

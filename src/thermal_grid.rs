@@ -524,7 +524,7 @@ impl CylinderGrid {
             ],
         );
         thermal::capacity_from_dimensions(&c).expect("cylindrical capacity")?;
-        let pin = &place(&c, None).pins[0];
+        let pin = &place(&c).pins[0];
         wire(sch, junction, (pin.x, pin.y));
         sch.components.push(c);
         Ok(())
@@ -653,7 +653,7 @@ fn connect_branch(
     radial: bool,
     surface: Option<(bool, String)>,
 ) -> Result<(), String> {
-    let placed = place(&c, None);
+    let placed = place(&c);
     let [first, second] = placed.pins.as_slice() else {
         return Err("円筒素子の端子を配置できません".into());
     };
@@ -804,7 +804,7 @@ fn surface_terminal(
     component.props[0].value = label.into();
     component.props[1].value = value.to_string();
     apply_profile(&mut component, schedule);
-    let pin = &place(&component, None).pins[0];
+    let pin = &place(&component).pins[0];
     let mut wire = Wire::new(pin.x - 80, pin.y, pin.x, pin.y);
     wire.set_label(net, pin.x - 75, pin.y - 35, (pin.x - 80, pin.y));
     sch.wires.push(wire);
@@ -831,7 +831,7 @@ fn surface_exchange(
             (if typ == "ThConvection" { 3 } else { 5 }, coefficient),
         ],
     );
-    let placed = place(&c, None);
+    let placed = place(&c);
     let first = &placed.pins[0];
     let second = &placed.pins[1];
     let mut left = Wire::new(first.x - 80, first.y, first.x, first.y);
@@ -856,7 +856,7 @@ fn surface_exchange(
     };
     t.props[1].value = temperature.to_string();
     apply_profile(&mut t, schedule);
-    let pin = &place(&t, None).pins[0];
+    let pin = &place(&t).pins[0];
     wire(sch, (second.x, second.y), (pin.x, pin.y));
     sch.components.push(t);
     Ok(())
@@ -1063,7 +1063,7 @@ impl Sweep {
         settings: &thermal::Settings,
     ) -> Result<SweepMetrics, String> {
         let sch = grid.generate()?;
-        let conn = crate::netlist::Connectivity::build(&sch, None);
+        let conn = crate::netlist::Connectivity::build(&sch);
         let network = thermal::Network::build(&sch, &conn)?;
         let results = if self.steady {
             network.steady()
@@ -1126,7 +1126,7 @@ mod tests {
         let total =
             grid.layers[0].material.density * grid.layers[0].material.specific_heat * area * 0.1;
         assert!((capacities.iter().sum::<f64>() - total).abs() < 1e-8);
-        let conn = Connectivity::build(&sch, None);
+        let conn = Connectivity::build(&sch);
         let issues = crate::check::check(&sch, &conn).issues;
         assert!(
             issues.is_empty(),
@@ -1147,7 +1147,7 @@ mod tests {
             ),
         ] {
             let sch = with_boundaries(sch.clone(), hot, cold);
-            let results = Network::build(&sch, &Connectivity::build(&sch, None))
+            let results = Network::build(&sch, &Connectivity::build(&sch))
                 .unwrap()
                 .steady()
                 .unwrap();
@@ -1174,7 +1174,7 @@ mod tests {
         .unwrap();
         assert!(!sch.wires.iter().any(|w| w.label.starts_with("内面")));
         let connected = with_boundaries(sch, "端面A", "外面");
-        let output = Network::build(&connected, &Connectivity::build(&connected, None))
+        let output = Network::build(&connected, &Connectivity::build(&connected))
             .unwrap()
             .steady()
             .unwrap();
@@ -1202,7 +1202,7 @@ mod tests {
         grid.surfaces[2].temperature = 45.0;
         grid.surfaces[3].kind = SurfaceKind::Temperature;
         let sch = Schematic::parse(&grid.generate().unwrap().serialize()).unwrap();
-        let conn = Connectivity::build(&sch, None);
+        let conn = Connectivity::build(&sch);
         let output = Network::build(&sch, &conn).unwrap().steady().unwrap();
         let expected =
             20.0 * std::f64::consts::TAU * 0.1 / (2.0_f64.ln() / 15.0 + 2.0_f64.ln() / 0.04);
@@ -1232,7 +1232,7 @@ mod tests {
         assert!((sum("ThPower", 1) - 12.0).abs() < 1e-10);
         assert!((sum("ThConvection", 4) - area).abs() < 1e-10);
         assert!((sum("ThRadiation", 4) - area).abs() < 1e-10);
-        let conn = Connectivity::build(&sch, None);
+        let conn = Connectivity::build(&sch);
         let issues = crate::check::check(&sch, &conn).issues;
         assert!(
             issues.is_empty(),
@@ -1283,7 +1283,7 @@ mod tests {
         grid.surfaces[2].temperature = 45.0;
         grid.surfaces[3].kind = SurfaceKind::Temperature;
         let sch = Schematic::parse(&grid.generate().unwrap().serialize()).unwrap();
-        let conn = Connectivity::build(&sch, None);
+        let conn = Connectivity::build(&sch);
         let issues = crate::check::check(&sch, &conn).issues;
         assert!(
             issues.is_empty(),
@@ -1336,7 +1336,7 @@ mod tests {
         let grid = CylinderGrid::read(&sch).unwrap();
         assert_eq!(grid.surfaces[0].power_profile.rows, "0,0\n1,12\n2,0");
         let sch = grid.generate().unwrap();
-        let conn = Connectivity::build(&sch, None);
+        let conn = Connectivity::build(&sch);
         let network = Network::build(&sch, &conn).unwrap();
         assert!((network.steady().unwrap().balance_w[0].values[0] - 4.0).abs() < 1e-10);
         let output = network
